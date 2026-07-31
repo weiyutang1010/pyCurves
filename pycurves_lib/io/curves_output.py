@@ -226,6 +226,11 @@ class CurvesOutputFormatter(VisualizationPayloadMixin):
                     "residue_name": residue_name,
                     "parent_base": parent_base,
                     "residue_id": int(ctx.molecule.residue_ids[atom_idx]),
+                    # Per-base standard frame [x_axis, y_axis, z_axis, origin]
+                    # (4x3). Same source the live engine passes to DeepPBS's
+                    # makeDNACG for degraded-base groove reconstruction; cached
+                    # here so a precomputed run preserves that salvage path.
+                    "frame": self._residue_frame(ctx, strand, level),
                 })
             strands.append({
                 "strand": strand + 1,
@@ -237,6 +242,27 @@ class CurvesOutputFormatter(VisualizationPayloadMixin):
             "n_levels": ctx.nux,
             "strands": strands,
         }
+
+    @staticmethod
+    def _residue_frame(ctx, strand: int, level: int):
+        """Return the per-base standard frame (4x3 list) or None.
+
+        Rows are [x_axis, y_axis, z_axis, origin], matching what the live
+        DeepPBS pyCurves engine reads from ``ctx.params.frames[strand, level]``.
+        Returns None when frames are unavailable or non-finite, so a consumer
+        can fall back exactly as it does for a missing frame.
+        """
+        params = getattr(ctx, "params", None)
+        frames = getattr(params, "frames", None)
+        if frames is None:
+            return None
+        try:
+            frame = np.asarray(frames[strand, level], dtype=float)
+        except (IndexError, TypeError, ValueError):
+            return None
+        if frame.shape != (4, 3) or not np.isfinite(frame).all() or not np.any(frame):
+            return None
+        return frame.tolist()
 
     def _primary_sequence_levels(self) -> List[int]:
         """Return actual strand-1 residue levels, excluding Curves gap levels."""
