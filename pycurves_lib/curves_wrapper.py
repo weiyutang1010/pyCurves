@@ -34,7 +34,8 @@ class CurvesWrapper:
         inpfile: Optional[str] = None,
         output_dir: str = ".",
         continuous_strands: bool = False,
-        frame_convention: str = "legacy",
+        altloc: Optional[str] = None,
+        frame_convention: str = "standard",
         axis_convention: str = "legacy",
         fit_override: Optional[bool] = None,
         grv_override: Optional[bool] = None,
@@ -50,6 +51,7 @@ class CurvesWrapper:
         self.inpfile = inpfile
         self.output_dir = output_dir
         self.continuous_strands = continuous_strands
+        self.altloc = MolecularLoader.normalize_altloc(altloc)
         self.frame_convention, self.axis_convention = self.normalize_conventions(frame_convention, axis_convention)
         self.fit_override = fit_override
         self.grv_override = grv_override
@@ -80,7 +82,8 @@ class CurvesWrapper:
         path: str,
         output_dir: str = ".",
         continuous_strands: bool = False,
-        frame_convention: str = "legacy",
+        altloc: Optional[str] = None,
+        frame_convention: str = "standard",
         axis_convention: str = "legacy",
     ):
         suffix = Path(path).suffix.lower()
@@ -91,6 +94,7 @@ class CurvesWrapper:
                 inpfile=path,
                 output_dir=output_dir,
                 continuous_strands=continuous_strands,
+                altloc=altloc,
                 frame_convention=frame_convention,
                 axis_convention=axis_convention,
             )
@@ -98,6 +102,7 @@ class CurvesWrapper:
             pdbfile=path,
             output_dir=output_dir,
             continuous_strands=continuous_strands,
+            altloc=altloc,
             frame_convention=frame_convention,
             axis_convention=axis_convention,
         )
@@ -106,9 +111,10 @@ class CurvesWrapper:
         self,
         inpfile: Optional[str] = None,
         pdbfile: Optional[str] = None,
-        mini: bool = True,
+        mini: Optional[bool] = None,
         verbose: bool = False,
         continuous_strands: Optional[bool] = None,
+        altloc: Optional[str] = None,
         frame_convention: Optional[str] = None,
         axis_convention: Optional[str] = None,
     ):
@@ -118,20 +124,20 @@ class CurvesWrapper:
             self.pdbfile = pdbfile
         if continuous_strands is not None:
             self.continuous_strands = continuous_strands
+        if altloc is not None:
+            self.altloc = MolecularLoader.normalize_altloc(altloc)
         next_frame_convention = self.frame_convention if frame_convention is None else frame_convention
         next_axis_convention = self.axis_convention if axis_convention is None else axis_convention
         self.frame_convention, self.axis_convention = self.normalize_conventions(
             next_frame_convention,
             next_axis_convention,
         )
-        if self.mini_override is not None:
-            mini = self.mini_override
-
         if self.inpfile is None:
             self.generated_inpfiles = self.generate_inp(pdbfile=self.pdbfile, output_dir=self.output_dir, continuous_strands=self.continuous_strands)
             self.inpfile = self.generated_inpfiles[0]
 
-        self.cfg = self._load_config()
+        mini_override = self.mini_override if self.mini_override is not None else mini
+        self.cfg = self._load_config(mini_override=mini_override)
 
         if self.pdbfile is None:
             self.pdbfile = self._pdbfile_from_config(self.cfg) or self._pdbfile_from_inp(self.inpfile)
@@ -139,15 +145,15 @@ class CurvesWrapper:
             raise ValueError("No PDB file is available. Pass pdbfile=... or include file=... in the .inp.")
 
         self.ctx = CurvesContext(self.cfg)
-        MolecularLoader.load(self.pdbfile, self.ctx)
+        MolecularLoader.load(self.pdbfile, self.ctx, altloc=self.altloc)
 
-        return self._analyze_loaded_context(mini=mini, verbose=verbose)
+        return self._analyze_loaded_context(verbose=verbose)
 
     def analyze_molecule(
         self,
         molecule: MolecularStructure,
         inpfile: Optional[str] = None,
-        mini: bool = True,
+        mini: Optional[bool] = None,
         verbose: bool = False,
         prev_opt_helical: Optional[np.ndarray] = None,
         axis_sign_reference: Optional[np.ndarray] = None,
@@ -159,16 +165,14 @@ class CurvesWrapper:
         """
         if inpfile is not None:
             self.inpfile = inpfile
-        if self.mini_override is not None:
-            mini = self.mini_override
         if self.inpfile is None:
             raise ValueError("analyze_molecule requires an existing Curves .inp file.")
 
-        self.cfg = self._load_config()
+        mini_override = self.mini_override if self.mini_override is not None else mini
+        self.cfg = self._load_config(mini_override=mini_override)
         self.ctx = CurvesContext(self.cfg)
         self.ctx.molecule = molecule
         return self._analyze_loaded_context(
-            mini=mini,
             verbose=verbose,
             prev_opt_helical=prev_opt_helical,
             axis_sign_reference=axis_sign_reference,
@@ -176,19 +180,18 @@ class CurvesWrapper:
 
     def _analyze_loaded_context(
         self,
-        mini: bool = True,
         verbose: bool = False,
         prev_opt_helical: Optional[np.ndarray] = None,
         axis_sign_reference: Optional[np.ndarray] = None,
     ):
-        self._validate_supported_legacy_options(mini=mini)
         log_parts = []
         curvesplus_axis = str(getattr(self.ctx.cfg, "axis_convention", self.axis_convention)).lower() == "curvesplus"
         if curvesplus_axis:
             # Curves+ axis mode is derived from standard base-pair frames and
             # smooth.f-style axis construction, not the legacy minimizer.
-            mini = False
             self.ctx.cfg.mini = False
+        mini = bool(self.ctx.cfg.mini)
+        self._validate_supported_legacy_options(mini=mini)
 
         reference_library = self._reference_library(getattr(self.ctx.cfg, "frame_convention", self.frame_convention))
         self.ctx.base_reference_library = reference_library
@@ -200,16 +203,18 @@ class CurvesWrapper:
         self.bak = BackboneAnalyzer()
         log_parts.append(self._capture_call(lambda: self.bak.analyze(self.ctx), echo=verbose))
 
-        if prev_opt_helical is not None:
-            self.ctx.params.helical = prev_opt_helical.copy()
         if axis_sign_reference is not None:
             self.ctx.axis_direction_sign_reference = np.asarray(axis_sign_reference, dtype=int).copy()
 
-        if mini:
+        if curvesplus_axis or self.ctx.cfg.zaxe:
+            self.opt = HelicalOptimizer(self.ctx)
+        else:
             from pycurves_lib.core.curves_optimizer_jax import HelicalOptimizerJAX
             self.opt = HelicalOptimizerJAX(self.ctx)
-        else:
-            self.opt = HelicalOptimizer(self.ctx)
+        if prev_opt_helical is not None:
+            # HelicalOptimizer.prepare() seeds XYTP values during construction.
+            # Apply trajectory warm starts after that initialization boundary.
+            self.ctx.params.helical = prev_opt_helical.copy()
         log_parts.append(self._capture_call(lambda: self.opt.print_fortran_setup_report(self.ctx), echo=verbose))
         log_parts.append(self._capture_call(lambda: self.opt.run(mini=mini), echo=verbose))
         if mini:
@@ -223,29 +228,32 @@ class CurvesWrapper:
     def _validate_supported_legacy_options(self, mini: bool = True) -> None:
         """Reject legacy modes that would currently produce misleading results."""
         cfg = self.ctx.cfg
-        if cfg.line:
+        if mini and cfg.line:
             raise NotImplementedError(
                 "line=.t. is not implemented in the current JAX optimizer. "
                 "Curves 5.3 treats it as a distinct straight-axis minimization mode."
             )
-        if cfg.dinu:
+        if mini and cfg.dinu:
             raise NotImplementedError(
                 "dinu=.t. is not implemented in the current JAX optimizer. "
                 "Curves 5.3 changes the objective from adjacent-base to dinucleotide terms."
             )
 
-    def _load_config(self) -> dict:
+    def _load_config(self, mini_override: Optional[bool] = None) -> dict:
         """Return a fresh runtime config from a cached parse of the .inp file."""
         if self.inpfile is None:
             raise ValueError("No Curves input file is available.")
+        overrides = self._config_overrides()
+        if mini_override is not None:
+            overrides["mini"] = bool(mini_override)
         cache_key = (
             str(Path(self.inpfile).resolve()),
-            tuple(sorted(self._config_overrides().items())),
+            tuple(sorted(overrides.items())),
         )
         if cache_key != self._parsed_config_cache_key:
             self._parsed_config_cache = ConfigLoader.parse_inp(
                 self.inpfile,
-                config_overrides=self._config_overrides(),
+                config_overrides=overrides,
             )
             self._parsed_config_cache_key = cache_key
         return copy.deepcopy(self._parsed_config_cache)
@@ -267,9 +275,7 @@ class CurvesWrapper:
             "axis_convention": self.axis_convention,
         }
 
-    def run(self, output: bool = True, mini: bool = True, verbose: bool = False, output_format: str = "curves", annotations: bool = True, visualization: bool = False):
-        if self.mini_override is not None:
-            mini = self.mini_override
+    def run(self, output: bool = True, mini: Optional[bool] = None, verbose: bool = False, output_format: str = "curves", annotations: bool = True, visualization: bool = False):
         self.analyze(mini=mini, verbose=verbose)
         if output:
             self.output(fmt=output_format, annotations=annotations, visualization=visualization)
@@ -318,6 +324,7 @@ class CurvesWrapper:
         output_dir: Optional[str] = None,
         prefix: Optional[str] = None,
         continuous_strands: bool = False,
+        altloc: Optional[str] = None,
     ) -> List[str]:
         pdbfile = pdbfile or self.pdbfile
         if pdbfile is None:
@@ -325,7 +332,8 @@ class CurvesWrapper:
 
         output_dir = output_dir or self.output_dir
         mol_holder = SimpleNamespace(molecule=MolecularStructure())
-        MolecularLoader.load(pdbfile, mol_holder)
+        selected_altloc = self.altloc if altloc is None else MolecularLoader.normalize_altloc(altloc)
+        MolecularLoader.load(pdbfile, mol_holder, altloc=selected_altloc)
         inferrer = RobustTopologyInferrer(mol_holder.molecule, pdbfile=Path(pdbfile).name)
         stem = prefix or f"{Path(pdbfile).stem}_auto"
         return inferrer.write_inp_files(
@@ -340,7 +348,7 @@ class CurvesWrapper:
 
     @staticmethod
     def _normalize_frame_convention(value: str) -> str:
-        normalized = str(value or "legacy").strip().lower().replace("-", "_")
+        normalized = str(value or "standard").strip().lower().replace("-", "_")
         if normalized in {"legacy"}:
             return "legacy"
         if normalized in {"standard", "curves_plus", "curves+", "curvesplus", "x3dna", "3dna"}:

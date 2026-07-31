@@ -18,9 +18,14 @@ from pycurves_lib.curves_wrapper import CurvesWrapper
 from pycurves_lib.cli.pycurves_cli_options import (
     add_pycurves_analysis_options,
     pycurves_runner_kwargs,
-    resolved_mini,
 )
 from pycurves_lib.md.trajectory_loader import TrajectoryLoader
+from pycurves_lib.md.trajectory_statistics import (
+    backbone_conformer_population_tables,
+    circular_degree_summary,
+    is_circular_degree_column,
+    linear_summary,
+)
 
 
 class MDTrajectoryAnalyzer:
@@ -33,9 +38,10 @@ class MDTrajectoryAnalyzer:
         inpfile: Optional[str] = None,
         output_dir: str = ".",
         annotations: bool = True,
-        frame_convention: str = "legacy",
+        frame_convention: str = "standard",
         axis_convention: str = "legacy",
         continuous_strands: bool = False,
+        altloc: Optional[str] = None,
         fit_override: Optional[bool] = None,
         grv_override: Optional[bool] = None,
         mini_override: Optional[bool] = None,
@@ -51,15 +57,17 @@ class MDTrajectoryAnalyzer:
             axis_convention,
         )
         self.continuous_strands = continuous_strands
+        self.altloc = MolecularLoader.normalize_altloc(altloc)
         self.fit_override = fit_override
         self.grv_override = grv_override
         self.mini_override = mini_override
         self.comb_override = comb_override
         self.ends_override = ends_override
         self.reference_topology_file = self._reference_topology(topology_file, trajectory_file, output_dir)
-        self.template_molecule = self._load_template_molecule(self.reference_topology_file)
+        self.template_molecule = self._load_template_molecule(self.reference_topology_file, self.altloc)
         self.runner_kwargs = {
             "continuous_strands": continuous_strands,
+            "altloc": self.altloc,
             "frame_convention": self.frame_convention,
             "axis_convention": self.axis_convention,
             "fit_override": fit_override,
@@ -83,7 +91,7 @@ class MDTrajectoryAnalyzer:
         frame_selector,
         selection: Dict,
         mode: str = "summary",
-        mini: bool = True,
+        mini: Optional[bool] = None,
         verbose: bool = False,
         warm_start: bool = True,
         axis_continuity: bool = True,
@@ -94,6 +102,7 @@ class MDTrajectoryAnalyzer:
         frame_payloads = []
         table_records: Dict[str, List[Dict]] = {}
         processed = 0
+        effective_mini = False
 
         prev_helical = None
         axis_sign_reference = None
@@ -108,8 +117,9 @@ class MDTrajectoryAnalyzer:
                 prev_opt_helical=prev_helical if warm_start else None,
                 axis_sign_reference=axis_sign_reference if axis_continuity else None,
             )
+            effective_mini = bool(runner.ctx.cfg.mini)
 
-            if warm_start and mini and hasattr(runner, 'ctx') and hasattr(runner.ctx, 'params') and hasattr(runner.ctx.params, 'helical'):
+            if warm_start and effective_mini and hasattr(runner, 'ctx') and hasattr(runner.ctx, 'params') and hasattr(runner.ctx.params, 'helical'):
                 prev_helical = runner.ctx.params.helical.copy()
             axis_direction_signs = []
             if hasattr(runner, "calc") and hasattr(runner.calc, "axis_direction_sign"):
@@ -152,9 +162,10 @@ class MDTrajectoryAnalyzer:
             },
             "analysis_options": {
                 "continuous_strands": self.continuous_strands,
+                "altloc": self.altloc or "first",
                 "fit": self.fit_override,
                 "grooves": self.grv_override,
-                "mini": False if self.axis_convention == "curvesplus" else (self.mini_override if self.mini_override is not None else mini),
+                "mini": effective_mini,
                 "comb": self.comb_override,
                 "ends": self.ends_override,
                 "axis_convention": self.axis_convention,
@@ -162,7 +173,7 @@ class MDTrajectoryAnalyzer:
             "selection": {
                 **selection,
                 "processed_frames": processed,
-                "warm_start": bool(warm_start),
+                "warm_start": bool(warm_start and effective_mini),
                 "axis_continuity": bool(axis_continuity),
             },
             "frame_convention": {
@@ -201,9 +212,9 @@ class MDTrajectoryAnalyzer:
                 self._write_rows_csv(f"{prefix}_{name}_frames.csv", rows)
 
     @staticmethod
-    def _load_template_molecule(topology_file: str) -> MolecularStructure:
+    def _load_template_molecule(topology_file: str, altloc=None) -> MolecularStructure:
         holder = type("MoleculeHolder", (), {"molecule": MolecularStructure()})()
-        MolecularLoader.load(topology_file, holder)
+        MolecularLoader.load(topology_file, holder, altloc=altloc)
         return holder.molecule
 
     @staticmethod
@@ -244,6 +255,12 @@ class MDTrajectoryAnalyzer:
 
     def _molecule_for_frame(self, coordinates: np.ndarray) -> MolecularStructure:
         coordinates = np.asarray(coordinates, dtype=float)
+        if coordinates.shape != self.template_molecule.coordinates.shape:
+            source_indices = self.template_molecule.source_atom_indices
+            if (source_indices is not None and coordinates.ndim == 2 and coordinates.shape[1] == 3
+                    and len(source_indices) == self.template_molecule.coordinates.shape[0]
+                    and len(source_indices) > 0 and int(np.max(source_indices)) < coordinates.shape[0]):
+                coordinates = coordinates[source_indices]
         if coordinates.shape != self.template_molecule.coordinates.shape:
             raise ValueError(
                 "Trajectory frame atom count does not match the topology molecule: "
@@ -326,15 +343,22 @@ class MDTrajectoryAnalyzer:
                         [row.get(col) for row in group_rows if row.get(col) is not None],
                         dtype=float,
                     )
-                    if vals.size == 0:
-                        out[f"{col}_mean"] = None
-                        out[f"{col}_variance"] = None
+                    if MDTrajectoryAnalyzer._is_circular_degree_column(col):
+                        stats = circular_degree_summary(vals)
                     else:
-                        out[f"{col}_mean"] = float(np.mean(vals))
-                        out[f"{col}_variance"] = float(np.var(vals))
+                        stats = linear_summary(vals)
+                    out[f"{col}_mean"] = stats.mean
+                    out[f"{col}_stddev"] = stats.stddev
                 table_summary.append(out)
             summaries[name] = table_summary
+
+        if "backbone" in tables:
+            summaries.update(backbone_conformer_population_tables(tables["backbone"]))
         return summaries
+
+    @staticmethod
+    def _is_circular_degree_column(column_name: str) -> bool:
+        return is_circular_degree_column(column_name)
 
     @staticmethod
     def _summary_key_value(value):
@@ -421,6 +445,68 @@ def collect_available_frame_indices(topology_file: str, trajectory_file: Optiona
     return [frame.index for frame in TrajectoryLoader.iter_frames(topology_file, trajectory_file)]
 
 
+def analyze_trajectory(
+    topology_file: str,
+    trajectory_file: Optional[str] = None,
+    inpfile: Optional[str] = None,
+    output_dir: str = ".",
+    frames: Optional[str] = None,
+    start: Optional[int] = None,
+    stop: Optional[int] = None,
+    step: int = 1,
+    mode: str = "per-frame",
+    annotations: bool = True,
+    frame_convention: str = "standard",
+    axis_convention: str = "legacy",
+    continuous_strands: bool = False,
+    altloc: Optional[str] = None,
+    fit: Optional[bool] = None,
+    grooves: Optional[bool] = None,
+    mini: Optional[bool] = None,
+    comb: Optional[bool] = None,
+    ends: Optional[bool] = None,
+    verbose: bool = False,
+    warm_start: bool = True,
+    axis_continuity: bool = True,
+) -> Dict:
+    """Run pyCurves trajectory analysis from Python and return the JSON-like payload.
+
+    This is the notebook-friendly equivalent of ``pycurves-md``. Use
+    ``mode="per-frame"`` or ``mode="both"`` when the payload will be converted
+    to long-form DataFrames with ``pycurves_md_plot.extract_block``.
+    """
+    if mode not in {"per-frame", "summary", "both"}:
+        raise ValueError("mode must be one of: per-frame, summary, both")
+    if step <= 0:
+        raise ValueError("step must be positive")
+
+    frame_selector, selection = make_frame_selector(frames, start, stop, step)
+    analyzer = MDTrajectoryAnalyzer(
+        topology_file=topology_file,
+        trajectory_file=trajectory_file,
+        inpfile=inpfile,
+        output_dir=output_dir,
+        annotations=annotations,
+        frame_convention=frame_convention,
+        axis_convention=axis_convention,
+        continuous_strands=continuous_strands,
+        altloc=altloc,
+        fit_override=fit,
+        grv_override=grooves,
+        mini_override=mini,
+        comb_override=comb,
+        ends_override=ends,
+    )
+    return analyzer.run(
+        frame_selector=frame_selector,
+        selection=selection,
+        mode=mode,
+        mini=mini,
+        verbose=verbose,
+        warm_start=warm_start,
+        axis_continuity=axis_continuity,
+    )
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run pyCurves over an MD trajectory.")
     parser.add_argument("topology", help="Topology/reference structure file, usually PDB or CIF.")
@@ -448,12 +534,6 @@ def main() -> None:
     )
     parser.add_argument("--verbose", action="store_true", help="Print per-frame pyCurves logs.")
     args = parser.parse_args()
-    mini = resolved_mini(args, default=True)
-    if args.axis_convention != "curvesplus" and not mini:
-        raise SystemExit(
-            "--no-mini is not supported for trajectory analysis yet; downstream axis, bend, and groove "
-            "parameters require the fitted helical axis."
-        )
 
     frame_selector, selection = make_frame_selector(args.frames, args.start, args.stop, args.step)
     analyzer = MDTrajectoryAnalyzer(
@@ -469,7 +549,7 @@ def main() -> None:
             frame_selector=frame_selector,
             selection=selection,
             mode=args.mode,
-            mini=mini,
+            mini=args.mini,
             verbose=args.verbose,
             warm_start=not args.no_warm_start,
             axis_continuity=not args.no_axis_continuity,
@@ -492,6 +572,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
 

@@ -75,7 +75,7 @@ class BaseGeometryConstants:
 class BaseLocator:
     def __init__(self, constants: BaseGeometryConstants, reference_library: BaseReferenceLibrary = None):
         self.const = constants
-        self.reference_library = reference_library or BaseReferenceLibrary.load("legacy")
+        self.reference_library = reference_library or BaseReferenceLibrary.load("standard")
         self.frame_fitter = BaseFrameFitter(self.reference_library)
 
     def locate_all(self, ctx: 'CurvesContext'):
@@ -366,10 +366,10 @@ class BaseLocator:
             "residue_name": atom_indices.get("residue_name", "").strip().upper(),
             "parent_base": atom_indices.get("parent_base", "unknown"),
             "template_used": atom_indices.get("template_base", "unknown"),
-            "frame_convention": getattr(ctx.cfg, "frame_convention", "legacy"),
+            "frame_convention": getattr(ctx.cfg, "frame_convention", "standard"),
             "fit_strategy": (
                 "standard_base_library"
-                if getattr(ctx.cfg, "frame_convention", "legacy") == "standard"
+                if getattr(ctx.cfg, "frame_convention", "standard") == "standard"
                 else ("parent_base_atoms" if atom_indices.get("is_modified") else "standard_base_atoms")
             ),
             "rmsd": float(rms),
@@ -397,10 +397,12 @@ class BaseLocator:
         sq2 = np.sqrt(2.0)
 
         valid_indices = []
+        valid_template_positions = []
         valid_bref = []
         for l in range(n):
             if nind[l] != -1:
                 valid_indices.append(nind[l])
+                valid_template_positions.append(l)
                 valid_bref.append(bref[lequ - 1, l])
 
         if len(valid_indices) < 3:
@@ -411,11 +413,21 @@ class BaseLocator:
         valid_bref = np.array(valid_bref)
 
         cg = np.mean(fit_coords, axis=0)
+        # Complete legacy templates are already centered and must retain the
+        # original Curves 5.3 calculation exactly. For an incomplete base,
+        # center the same available reference subset used for the coordinate
+        # fit, as in the missing-atom-capable Curves+ least-squares routine.
+        reference_center = (
+            np.zeros(3)
+            if len(valid_indices) == n
+            else np.mean(valid_bref, axis=0)
+        )
+        centered_bref = valid_bref - reference_center
 
         u = np.zeros((3, 3))
         for l in range(len(fit_indices)):
             idx = fit_indices[l]
-            standard_pos = valid_bref[l]
+            standard_pos = centered_bref[l]
             real_pos_shifted = mol.coordinates[idx] - cg
             u += np.outer(standard_pos, real_pos_shifted) / len(fit_indices)
         det = np.linalg.det(u)
@@ -442,14 +454,15 @@ class BaseLocator:
 
         rot_u = k @ np.diag([1.0, 1.0, np.sign(det)]) @ h.T
 
-        dcor = (bref[lequ - 1, :n] @ rot_u.T) + cg
-        rms = np.sqrt(np.mean(np.sum((fit_coords - dcor)**2, axis=1)))
+        dcor = ((bref[lequ - 1, :n] - reference_center) @ rot_u.T) + cg
+        fitted_present_coords = dcor[valid_template_positions]
+        rms = np.sqrt(np.mean(np.sum((fit_coords - fitted_present_coords)**2, axis=1)))
         return dcor, rms, 0
     
     def _calculate_base_frame(self, strand: int, level: int, atom_data: dict, ctx: 'CurvesContext'):
         """
         """
-        if getattr(ctx.cfg, "frame_convention", "legacy") == "standard" and ctx.cfg.fit:
+        if getattr(ctx.cfg, "frame_convention", "standard") == "standard" and ctx.cfg.fit:
             result = self._calculate_standard_base_frame(strand, level, atom_data, ctx)
             if result is not None:
                 return result
@@ -612,6 +625,13 @@ class MolecularStructure:
     residue_names: np.ndarray = None # munit [cite: 1, 89]
     residue_ids: np.ndarray = None   # nunit [cite: 1, 89]
     chain_ids: np.ndarray = None
+    insertion_codes: np.ndarray = None
+    altlocs: np.ndarray = None
+    occupancies: np.ndarray = None
+    model_ids: np.ndarray = None
+    source_atom_indices: np.ndarray = None
+    altloc_selection: str = "first"
+    available_altlocs: tuple = ()
     
     # Topology
     atom_types: np.ndarray = None     # imch [cite: 1, 89]
@@ -697,7 +717,7 @@ class HelicalConfig:
     test: bool = False    # Test/debug mode from Curves input.
     old: bool = True      # Curves 5.3 compatibility mode.
     axonly: bool = False  # Axis-only calculation.
-    frame_convention: str = "legacy"  # Base reference-frame convention: legacy or standard.
+    frame_convention: str = "standard"  # Base reference-frame convention: standard or legacy.
     axis_convention: str = "legacy"  # Global axis convention: legacy optimizer or curvesplus axis/smooth.
 
     # Fortran hel(0,*,*) and hel(nux+1,*,*) terminal rows used when ends=.t.
@@ -757,6 +777,9 @@ class CurvesContext:
         self.ni_map = np.array(cfg['ni_map'])   # Fortran ni: subunit index per strand/level.
         self.hoogsteen_markers = set(cfg.get('hoogsteen_markers', set()) or set())
         self.pair_geometry_markers = dict(cfg.get('pair_geometry_markers', {}) or {})
+        self.glycosidic_conformation_markers = dict(
+            cfg.get('glycosidic_conformation_markers', {}) or {}
+        )
         self.active_start_levels = self.ng  # Readable alias for Fortran ng.
         self.active_end_levels = self.nr  # Readable alias for Fortran nr.
         self.subunit_map = self.ni_map  # Readable alias for Fortran ni.
@@ -777,7 +800,7 @@ class CurvesContext:
             
             angles = np.full((self.n_strands, n3, 2), 999.0),
             
-            sugar_pucker = np.zeros((self.n_strands, n3, 2)),
+            sugar_pucker = np.full((self.n_strands, n3, 2), 999.0),
             
             # Atom indices are Python 0-based; -1 means "not found".
             atom_map = np.full((self.n_strands, n3, 15), -1, dtype=int),

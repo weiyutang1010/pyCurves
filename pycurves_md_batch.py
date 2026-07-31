@@ -4,116 +4,18 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List, Optional
 
 import numpy as np
 from tqdm import tqdm
 
 from pycurves_lib.io.curves_output import _to_jsonable
-from pycurves_lib.md.batch_curvesplus import BatchCurvesPlusMDAnalyzer
 from pycurves_lib.md.trajectory_loader import TrajectoryLoader
+from pycurves_lib.md.trajectory_statistics import (
+    BatchSummaryAccumulator,
+)
 from pycurves_md import MDTrajectoryAnalyzer, make_frame_selector
-
-
-class BatchSummaryAccumulator:
-    """Accumulate trajectory summary statistics without materializing frames."""
-
-    def __init__(self) -> None:
-        self._tables: Dict[str, Dict[tuple, Dict]] = {}
-
-    def ensure_table(self, table_name: str) -> None:
-        self._tables.setdefault(table_name, {})
-
-    def add_values(self, table_name: str, metadata: Dict, parameter_names, values) -> None:
-        self.ensure_table(table_name)
-        arr = np.asarray(values, dtype=float)
-        if arr.ndim == 1:
-            arr = arr.reshape(-1, 1)
-        if arr.size == 0:
-            return
-        row_count = int(arr.shape[0])
-        metadata = dict(metadata)
-        key = tuple(metadata.items())
-        group = self._tables[table_name].get(key)
-        if group is None:
-            group = {
-                "metadata": metadata,
-                "count": 0,
-                "stats": {
-                    name: {"valid": 0, "sum": 0.0, "sumsq": 0.0}
-                    for name in parameter_names
-                },
-            }
-            self._tables[table_name][key] = group
-        group["count"] += row_count
-        for col_index, name in enumerate(parameter_names):
-            column = arr[:, col_index]
-            finite = np.isfinite(column)
-            if not np.any(finite):
-                continue
-            vals = column[finite]
-            stats = group["stats"][name]
-            stats["valid"] += int(vals.size)
-            stats["sum"] += float(np.sum(vals))
-            stats["sumsq"] += float(np.sum(vals * vals))
-
-    def add_rows(self, table_name: str, rows: List[Dict], numeric_names) -> None:
-        self.ensure_table(table_name)
-        numeric_names = tuple(numeric_names)
-        numeric_set = set(numeric_names)
-        for row in rows:
-            metadata = {
-                key: value
-                for key, value in row.items()
-                if key not in numeric_set and key not in {"frame", "time"}
-            }
-            key = tuple(metadata.items())
-            group = self._tables[table_name].get(key)
-            if group is None:
-                group = {
-                    "metadata": metadata,
-                    "count": 0,
-                    "stats": {
-                        name: {"valid": 0, "sum": 0.0, "sumsq": 0.0}
-                        for name in numeric_names
-                    },
-                }
-                self._tables[table_name][key] = group
-            group["count"] += 1
-            for name in numeric_names:
-                value = row.get(name)
-                if value is None:
-                    continue
-                number = float(value)
-                if not np.isfinite(number):
-                    continue
-                stats = group["stats"][name]
-                stats["valid"] += 1
-                stats["sum"] += number
-                stats["sumsq"] += number * number
-
-    def to_summary(self) -> Dict[str, List[Dict]]:
-        output: Dict[str, List[Dict]] = {}
-        for table_name, groups in self._tables.items():
-            rows = []
-            for group in groups.values():
-                out = dict(group["metadata"])
-                out["count"] = int(group["count"])
-                for name, stats in group["stats"].items():
-                    valid = int(stats["valid"])
-                    if valid == 0:
-                        out[f"{name}_mean"] = None
-                        out[f"{name}_variance"] = None
-                    else:
-                        mean = stats["sum"] / valid
-                        variance = stats["sumsq"] / valid - mean * mean
-                        if abs(variance) < 1e-15:
-                            variance = 0.0
-                        out[f"{name}_mean"] = float(mean)
-                        out[f"{name}_variance"] = float(variance)
-                rows.append(out)
-            output[table_name] = rows
-        return output
 
 
 def _flush_batch(
@@ -123,7 +25,6 @@ def _flush_batch(
     times: List[Optional[float]],
     mode: str,
     frame_payloads: List[Dict],
-    table_records: Dict[str, List[Dict]],
     summary_accumulator: Optional[BatchSummaryAccumulator] = None,
 ) -> int:
     if not coordinates:
@@ -132,12 +33,14 @@ def _flush_batch(
     if mode == "summary" and summary_accumulator is not None:
         return analyzer.accumulate_batch_summary(batch_coordinates, frame_indices, times, summary_accumulator)
 
-    batch_frames, batch_tables = analyzer.analyze_batch(batch_coordinates, frame_indices, times)
+    batch_frames, _ = analyzer.analyze_batch(
+        batch_coordinates,
+        frame_indices,
+        times,
+        accumulator=summary_accumulator if mode == "both" else None,
+    )
     if mode in {"per-frame", "both"}:
         frame_payloads.extend(batch_frames)
-    if mode in {"summary", "both"}:
-        for name, rows in batch_tables.items():
-            table_records.setdefault(name, []).extend(rows)
     return len(coordinates)
 
 
@@ -165,6 +68,8 @@ def _write_csv_payload(payload: Dict, prefix: str) -> None:
 
 
 def run_batch(args) -> Dict:
+    from pycurves_lib.md.batch_curvesplus import BatchCurvesPlusMDAnalyzer
+
     if args.axis_convention.lower().replace("-", "_") not in {"curvesplus", "curves_plus", "curves+", "canal"}:
         raise SystemExit("pycurves-md-batch currently supports only --axis-convention curvesplus.")
     if args.frame_convention.lower().replace("-", "_") not in {"standard", "curvesplus", "curves_plus", "curves+", "x3dna", "3dna"}:
@@ -185,11 +90,11 @@ def run_batch(args) -> Dict:
         include_grooves=args.grooves,
         include_curvesplus_axis_steps=args.curvesplus_axis_steps,
         include_fit_quality=args.fit_quality,
+        altloc=args.altloc,
     )
 
     frame_payloads: List[Dict] = []
-    table_records: Dict[str, List[Dict]] = {}
-    summary_accumulator = BatchSummaryAccumulator() if args.mode == "summary" else None
+    summary_accumulator = BatchSummaryAccumulator() if args.mode in {"summary", "both"} else None
     coordinates: List[np.ndarray] = []
     frame_indices: List[int] = []
     times: List[Optional[float]] = []
@@ -208,7 +113,6 @@ def run_batch(args) -> Dict:
                 times,
                 args.mode,
                 frame_payloads,
-                table_records,
                 summary_accumulator,
             )
             coordinates.clear()
@@ -222,7 +126,6 @@ def run_batch(args) -> Dict:
         times,
         args.mode,
         frame_payloads,
-        table_records,
         summary_accumulator,
     )
     if processed == 0:
@@ -241,6 +144,7 @@ def run_batch(args) -> Dict:
         "analysis_options": {
             "batch_size": args.batch_size,
             "continuous_strands": args.continuous_strands,
+            "altloc": args.altloc or "first",
             "fit": True if args.fit is None else args.fit,
             "comb": True if args.comb is None else args.comb,
             "ends": False if args.ends is None else args.ends,
@@ -264,12 +168,69 @@ def run_batch(args) -> Dict:
     }
     if args.mode in {"per-frame", "both"}:
         payload["frames"] = frame_payloads
-    if args.mode == "summary":
+    if args.mode in {"summary", "both"}:
         payload["summary"] = summary_accumulator.to_summary() if summary_accumulator is not None else {}
-    elif args.mode == "both":
-        payload["summary"] = MDTrajectoryAnalyzer._summarize_tables(table_records)
     return payload
 
+
+def analyze_trajectory_batch(
+    topology_file: str,
+    trajectory_file: Optional[str] = None,
+    inpfile: Optional[str] = None,
+    output_dir: str = ".",
+    frames: Optional[str] = None,
+    start: Optional[int] = None,
+    stop: Optional[int] = None,
+    step: int = 1,
+    batch_size: int = 128,
+    mode: str = "per-frame",
+    continuous_strands: bool = False,
+    altloc: Optional[str] = None,
+    fit: Optional[bool] = None,
+    grooves: Optional[bool] = None,
+    comb: Optional[bool] = None,
+    ends: Optional[bool] = None,
+    frame_convention: str = "standard",
+    axis_convention: str = "curvesplus",
+    curvesplus_axis_steps: bool = False,
+    fit_quality: bool = False,
+) -> Dict:
+    """Run the vectorized Curves+/standard-frame MD path from Python.
+
+    This is the notebook-friendly equivalent of ``pycurves-md-batch``. It is
+    intended for canonical, standard-frame analyses where the experimental
+    batch engine is applicable.
+    """
+    if mode not in {"per-frame", "summary", "both"}:
+        raise ValueError("mode must be one of: per-frame, summary, both")
+    args = SimpleNamespace(
+        topology=topology_file,
+        trajectory=trajectory_file,
+        inp=inpfile,
+        output_dir=output_dir,
+        output_file=None,
+        mode=mode,
+        format="json",
+        frames=frames,
+        start=start,
+        stop=stop,
+        step=step,
+        batch_size=batch_size,
+        continuous_strands=continuous_strands,
+        fit=fit,
+        grooves=grooves,
+        comb=comb,
+        ends=ends,
+        frame_convention=frame_convention,
+        axis_convention=axis_convention,
+        curvesplus_axis_steps=curvesplus_axis_steps,
+        fit_quality=fit_quality,
+        altloc=altloc,
+    )
+    try:
+        return run_batch(args)
+    except SystemExit as exc:
+        raise ValueError(str(exc)) from exc
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -291,6 +252,7 @@ def main() -> None:
     parser.add_argument("--step", type=int, default=1, help="Frame stride.")
     parser.add_argument("--batch-size", type=int, default=128, help="Number of selected frames processed per vectorized batch.")
     parser.add_argument("--continuous-strands", action="store_true", help="Treat connected helical components as continuous during .inp inference.")
+    parser.add_argument("--altloc", help="Alternate conformation such as A or B; default keeps Gemmi's first-listed conformer.")
     parser.add_argument("--fit", action=argparse.BooleanOptionalAction, default=None, help="Override least-squares base fitting; batch mode currently requires true.")
     parser.add_argument("--comb", action=argparse.BooleanOptionalAction, default=None, help="Override combined strand analysis; batch mode currently requires true.")
     parser.add_argument("--ends", action=argparse.BooleanOptionalAction, default=None, help="Override terminal virtual end levels; batch mode currently requires false.")
@@ -323,8 +285,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
 
 
 

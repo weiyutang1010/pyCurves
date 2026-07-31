@@ -6,7 +6,11 @@ import networkx as nx
 import numpy as np
 
 from pycurves_lib.core.curves_dataclasses import MolecularStructure
-from pycurves_lib.topology.base_annotations import BASE_EDGE_ATOMS
+from pycurves_lib.topology.base_annotations import (
+    BASE_EDGE_ATOMS,
+    EDGE_ORDER,
+    infer_glycosidic_conformation,
+)
 from pycurves_lib.data.modified_bases import parent_base_name
 
 
@@ -42,6 +46,8 @@ SUGAR_C1_ATOMS = ("C1'", "C1*")
 
 HBOND_DISTANCE_CUTOFF = 3.8
 HBOND_PREFILTER_DISTANCE = 11.0
+BASE_PAIR_PLANE_OFFSET_CUTOFF = 3.2
+PAIR_GEOMETRY_PLANE_OFFSET_CUTOFF = 2.0
 GLYCOSIDIC_SIDE_EPSILON = 0.25
 SUSPICIOUS_BACKBONE_GAP_DISTANCE = 8.5
 REGISTER_GAP_CENTER_CUTOFF = 7.8
@@ -122,6 +128,7 @@ class InferredTopology:
     ends: bool = False
     hoogsteen_markers: set = field(default_factory=set)
     pair_geometry_markers: Dict[Tuple[int, int], str] = field(default_factory=dict)
+    glycosidic_conformation_markers: Dict[Tuple[int, int], str] = field(default_factory=dict)
 
     @property
     def n_strands(self) -> int:
@@ -149,14 +156,20 @@ class InferredTopology:
             tokens = []
             for level, value in enumerate(row, start=1):
                 token = str(int(value))
+                tags = []
                 geometry_tag = self.pair_geometry_markers.get((strand, level)) if int(value) != 0 else None
                 if geometry_tag:
-                    token = f"{token}[{geometry_tag}]"
+                    tags.append(geometry_tag)
                 elif int(value) != 0 and (
                     (strand, level) in self.hoogsteen_markers
                     or level in self.hoogsteen_markers
                 ):
-                    token = f"{token}[Hoog]"
+                    tags.append("Hoog")
+                conformation = self.glycosidic_conformation_markers.get((strand, level))
+                if int(value) != 0 and conformation == "syn":
+                    tags.append("syn")
+                if tags:
+                    token += "".join(f"[{tag}]" for tag in tags)
                 tokens.append(token)
             lines.append(" " + " ".join(tokens))
         lines.append("0.0 0.0 0.0 0.0")
@@ -419,6 +432,12 @@ class RobustTopologyInferrer:
                     residue_1 = self.residues[left]
                     residue_2 = self.residues[right]
                     center_distance = float(np.linalg.norm(residue_1.center - residue_2.center))
+                    score = self._base_pair_candidate_score(
+                        "source_annotated",
+                        hbond_count=2,
+                        mean_distance=center_distance,
+                        center_distance=center_distance,
+                    )
                     candidates.append(BasePairCandidate(
                         first=left,
                         second=right,
@@ -426,7 +445,7 @@ class RobustTopologyInferrer:
                         second_strand=right_strand,
                         hbond_count=2,
                         mean_distance=center_distance,
-                        score=-100.0 + center_distance,
+                        score=score,
                         pair_family="source_annotated",
                         atom_pairs=(),
                         is_hoogsteen=bool(row.get("is_hoogsteen")),
@@ -447,22 +466,32 @@ class RobustTopologyInferrer:
 
         pattern_matches, pattern_family = self._pattern_hbond_matches(residue_1.base, residue_2.base, atom_map_1, atom_map_2)
         generic_matches = self._generic_hbond_matches(residue_1, residue_2, atom_map_1, atom_map_2)
-        matches = pattern_matches if len(pattern_matches) >= len(generic_matches) else generic_matches
 
         if len(pattern_matches) >= 2:
             pair_family = pattern_family
+            matches = pattern_matches
         elif len(generic_matches) >= 2:
             pair_family = "hbonded_noncanonical"
+            matches = generic_matches
         else:
             return None
 
         center_distance = float(np.linalg.norm(residue_1.center - residue_2.center))
         if center_distance > 9.0:
             return None
+        plane_offset = self._base_pair_plane_offset(residue_1, residue_2)
+        if (
+            pair_family == "hbonded_noncanonical"
+            and plane_offset is not None
+            and plane_offset > BASE_PAIR_PLANE_OFFSET_CUTOFF
+        ):
+            return None
 
         distances = [distance for _, _, distance in matches]
         mean_distance = float(np.mean(distances))
         score = self._base_pair_candidate_score(pair_family, len(matches), mean_distance, center_distance)
+        if plane_offset is not None:
+            score += max(0.0, plane_offset - PAIR_GEOMETRY_PLANE_OFFSET_CUTOFF)
         return BasePairCandidate(
             first=first,
             second=second,
@@ -517,15 +546,25 @@ class RobustTopologyInferrer:
 
         best_matches: List[Tuple[str, str, float]] = []
         best_family = "unknown"
+
+        def is_better(matches: List[Tuple[str, str, float]]) -> bool:
+            if len(matches) != len(best_matches):
+                return len(matches) > len(best_matches)
+            if not matches:
+                return False
+            best_mean = float(np.mean([distance for _, _, distance in best_matches])) if best_matches else float("inf")
+            mean_distance = float(np.mean([distance for _, _, distance in matches]))
+            return mean_distance < best_mean
+
         for key, family in possible_patterns:
             matches = self._matches_for_pattern(BASE_PAIR_HBONDS.get(key, ()), atom_map_1, atom_map_2)
-            if len(matches) > len(best_matches):
+            if is_better(matches):
                 best_matches = matches
                 best_family = family
         for key, family in reversed_patterns:
             reverse_pattern = tuple((right, left) for left, right in BASE_PAIR_HBONDS.get(key, ()))
             matches = self._matches_for_pattern(reverse_pattern, atom_map_1, atom_map_2)
-            if len(matches) > len(best_matches):
+            if is_better(matches):
                 best_matches = matches
                 best_family = family
         return best_matches, best_family
@@ -583,13 +622,32 @@ class RobustTopologyInferrer:
             atom_map.setdefault(atom_name, self.mol.coordinates[atom_idx])
         return atom_map
 
-    def _base_normal(self, residue: ResidueNode) -> np.ndarray:
+    def _base_normal(self, residue: ResidueNode) -> Optional[np.ndarray]:
         atom_map = self._atom_map(residue)
-        coords = np.array(list(atom_map.values()))
-        center = np.mean(coords, axis=0)
-        cov = np.cov(coords - center, rowvar=False)
-        eigvals, eigvecs = np.linalg.eigh(cov)
-        return eigvecs[:, 0]
+        atom_names = set(BASE_ATOMS.get(residue.base, set()))
+        if not atom_names:
+            for edge_atoms in BASE_EDGE_ATOMS.get(residue.base, {}).values():
+                atom_names.update(edge_atoms)
+        if not atom_names:
+            atom_names = {"N1", "N9", "C2", "C4", "C5", "C6", "C8", "N3", "N7"}
+        points = [atom_map[name] for name in atom_names if name in atom_map]
+        if len(points) < 3:
+            return None
+        coords = np.asarray(points, dtype=float)
+        centered = coords - np.mean(coords, axis=0)
+        try:
+            _, _, vh = np.linalg.svd(centered, full_matrices=False)
+        except np.linalg.LinAlgError:
+            return None
+        return self._unit_vector(vh[-1])
+
+    def _base_pair_plane_offset(self, residue_1: ResidueNode, residue_2: ResidueNode) -> Optional[float]:
+        delta = residue_2.hbond_center - residue_1.hbond_center
+        offsets = []
+        for normal in (self._base_normal(residue_1), self._base_normal(residue_2)):
+            if normal is not None:
+                offsets.append(abs(float(np.dot(delta, normal))))
+        return max(offsets) if offsets else None
 
     @staticmethod
     def _select_one_to_one_pairs(candidates: Sequence[BasePairCandidate]) -> List[BasePairCandidate]:
@@ -703,7 +761,11 @@ class RobustTopologyInferrer:
         self._collapse_opposing_internal_gap_pairs(row_1, row_2)
 
         paired_count = sum(1 for left, right in zip(row_1, row_2) if left > 0 and right > 0)
-        nu_raw = [sum(1 for subunit in row_1 if subunit > 0), partner_direction * sum(1 for subunit in row_2 if subunit > 0)]
+        # Curves uses the signed magnitude to determine how many aligned
+        # mapping columns to read. Internal zero/gap entries still occupy a
+        # column, so counting only nonzero residues can truncate the row when
+        # both strands contain gaps.
+        nu_raw = [len(row_1), partner_direction * len(row_2)]
         ni_map = np.array([row_1, row_2], dtype=int)
         pair_edges = [(candidate.first, candidate.second) for candidate in selected_pairs]
         level_by_subunit = {}
@@ -718,6 +780,7 @@ class RobustTopologyInferrer:
                 strand_by_subunit[subunit] = 2
         hoogsteen_markers = set()
         pair_geometry_markers = {}
+        glycosidic_conformation_markers = self._glycosidic_markers_for_map(ni_map)
         for candidate in selected_pairs:
             if candidate.first not in level_by_subunit or candidate.second not in level_by_subunit:
                 continue
@@ -752,6 +815,7 @@ class RobustTopologyInferrer:
             grv=paired_count >= 4,
             hoogsteen_markers=hoogsteen_markers,
             pair_geometry_markers=pair_geometry_markers,
+            glycosidic_conformation_markers=glycosidic_conformation_markers,
         )
 
     def _hoogsteen_marker_subunit(self, candidate: BasePairCandidate) -> int:
@@ -774,14 +838,6 @@ class RobustTopologyInferrer:
     ) -> Optional[Tuple[int, int, str]]:
         residue_1 = self.residues[candidate.first]
         residue_2 = self.residues[candidate.second]
-        should_write = (
-            candidate.is_hoogsteen
-            or candidate.pair_family == "hbonded_noncanonical"
-            or not self._is_complementary(residue_1.base, residue_2.base)
-        )
-        if not should_write:
-            return None
-
         atom_pairs = candidate.atom_pairs or self._marker_atom_pairs(candidate)
         if not atom_pairs:
             return None
@@ -797,11 +853,32 @@ class RobustTopologyInferrer:
         if not edge_1 or not edge_2:
             return None
 
-        orientation = (
+        pattern_matches, pattern_family = self._pattern_hbond_matches(
+            residue_1.base,
+            residue_2.base,
+            self._atom_map(residue_1),
+            self._atom_map(residue_2),
+        )
+        canonical_watson_contacts = (
+            edge_1 == edge_2 == "W"
+            and pattern_family == "watson_crick_or_wobble"
+            and len(pattern_matches) >= 2
+        )
+        orientation = "c" if canonical_watson_contacts else (
             self._measured_glycosidic_orientation(candidate, atom_pairs)
             or self._lw_orientation_from_edges(edge_1, edge_2, strand_direction)
         )
-        tag = self._lw_tag_for_edges(edge_1, edge_2, orientation, strand_direction)
+        tag = self._lw_tag_for_edges(edge_1, edge_2, orientation)
+        measured_noncanonical = (edge_1, edge_2) != ("W", "W") or orientation == "t"
+        should_write = (
+            candidate.is_hoogsteen
+            or candidate.pair_family == "hbonded_noncanonical"
+            or not self._is_complementary(residue_1.base, residue_2.base)
+            or measured_noncanonical
+        )
+        if not should_write:
+            return None
+
         strand_id = strand_by_subunit.get(candidate.first)
         level = level_by_subunit.get(candidate.first)
         if strand_id is None or level is None:
@@ -834,7 +911,7 @@ class RobustTopologyInferrer:
             scores.append((score, edge))
         if not scores:
             return ""
-        scores.sort(reverse=True)
+        scores.sort(key=lambda item: (-item[0], EDGE_ORDER.get(item[1], 99)))
         return scores[0][1]
 
     @staticmethod
@@ -844,10 +921,24 @@ class RobustTopologyInferrer:
         return "c" if strand_direction == cis_direction else "t"
 
     @staticmethod
-    def _lw_tag_for_edges(edge_1: str, edge_2: str, orientation: str, strand_direction: str) -> str:
-        suffix = {"parallel": "p", "antiparallel": "ap"}.get(strand_direction)
-        tag = f"{orientation}{edge_1}{edge_2}"
-        return f"{tag}:{suffix}" if suffix else tag
+    def _lw_tag_for_edges(edge_1: str, edge_2: str, orientation: str) -> str:
+        return f"{orientation}{edge_1}{edge_2}"
+
+    def _glycosidic_markers_for_map(
+        self,
+        ni_map: np.ndarray,
+    ) -> Dict[Tuple[int, int], str]:
+        markers: Dict[Tuple[int, int], str] = {}
+        for strand_index, row in enumerate(np.asarray(ni_map), start=1):
+            for level, raw_subunit in enumerate(row, start=1):
+                subunit = int(raw_subunit)
+                if subunit <= 0 or subunit not in self.residues:
+                    continue
+                residue = self.residues[subunit]
+                conformation = infer_glycosidic_conformation(residue.base, self._atom_map(residue))
+                if conformation == "syn":
+                    markers[(strand_index, level)] = "syn"
+        return markers
 
     def _measured_glycosidic_orientation(
         self,
@@ -879,13 +970,7 @@ class RobustTopologyInferrer:
         if contact_axis is None:
             return ""
 
-        normal_1 = self._base_normal(residue_1)
-        normal_2 = self._base_normal(residue_2)
-        if np.dot(normal_1, normal_2) < 0.0:
-            normal_2 = -normal_2
-        pair_normal = self._unit_vector(normal_1 + normal_2)
-        if pair_normal is None:
-            pair_normal = self._unit_vector(normal_1)
+        pair_normal = self._pair_base_normal(residue_1, residue_2)
         if pair_normal is None:
             return ""
 
@@ -921,6 +1006,16 @@ class RobustTopologyInferrer:
         if not np.isfinite(norm) or norm <= 1.0e-10:
             return None
         return np.asarray(vector, dtype=float) / norm
+
+    def _pair_base_normal(self, residue_1: ResidueNode, residue_2: ResidueNode) -> Optional[np.ndarray]:
+        normal_1 = self._base_normal(residue_1)
+        normal_2 = self._base_normal(residue_2)
+        if normal_1 is None or normal_2 is None:
+            return normal_1 if normal_2 is None else normal_2
+        if np.dot(normal_1, normal_2) < 0.0:
+            normal_2 = -normal_2
+        combined = self._unit_vector(normal_1 + normal_2)
+        return combined if combined is not None else normal_1
 
     def _drop_isolated_register_outliers(
         self,
@@ -1590,10 +1685,16 @@ class RobustTopologyInferrer:
         normal = self._base_normal(residue)
         left_normal = self._base_normal(left_residue)
         right_normal = self._base_normal(right_residue)
-        best_alignment = max(
-            abs(float(np.dot(normal, left_normal))),
-            abs(float(np.dot(normal, right_normal))),
-        )
+        if normal is None:
+            return 0.0
+        alignments = []
+        if left_normal is not None:
+            alignments.append(abs(float(np.dot(normal, left_normal))))
+        if right_normal is not None:
+            alignments.append(abs(float(np.dot(normal, right_normal))))
+        if not alignments:
+            return 0.0
+        best_alignment = max(alignments)
         return float(max(0.0, 1.0 - best_alignment))
 
     @staticmethod
@@ -1706,6 +1807,7 @@ class RobustTopologyInferrer:
             chain_ids=[self.residues[selected[0]].chain],
             comb=False,
             grv=False,
+            glycosidic_conformation_markers=self._glycosidic_markers_for_map(row.reshape(1, -1)),
         )
 
     def _build_pairing_graph(self) -> nx.Graph:
@@ -1768,6 +1870,7 @@ class RobustTopologyInferrer:
                 chain_ids=[self.residues[selected[0][0]].chain],
                 comb=False,
                 grv=False,
+                glycosidic_conformation_markers=self._glycosidic_markers_for_map(row.reshape(1, -1)),
             )
 
         ref = selected[0]
@@ -1829,6 +1932,7 @@ class RobustTopologyInferrer:
             comb=True,
             fit=True,
             grv=paired_count >= 4,
+            glycosidic_conformation_markers=self._glycosidic_markers_for_map(ni_map),
         )
 
     def _trim_to_paired_core(self, rows: List[List[int]], nu_raw: List[int]) -> Tuple[List[List[int]], List[int]]:
@@ -1869,9 +1973,8 @@ class RobustTopologyInferrer:
         distance = float(np.linalg.norm(residue_1.hbond_center - residue_2.hbond_center))
         if distance > 12.0:
             return float("inf")
-        normal = self._base_normal(residue_1)
-        plane_dist = abs(float(np.dot(residue_2.hbond_center - residue_1.hbond_center, normal)))
-        plane_penalty = 10.0 if plane_dist > 2.0 else 0.0
+        plane_dist = self._base_pair_plane_offset(residue_1, residue_2)
+        plane_penalty = 10.0 if plane_dist is not None and plane_dist > PAIR_GEOMETRY_PLANE_OFFSET_CUTOFF else 0.0
         complement_bonus = -2.0 if self._is_complementary(residue_1.base, residue_2.base) else 0.0
         return distance + complement_bonus + plane_penalty
 

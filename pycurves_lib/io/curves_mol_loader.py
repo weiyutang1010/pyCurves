@@ -1,7 +1,14 @@
 import gzip
+from typing import TYPE_CHECKING
+import warnings
+
 import gemmi
 import numpy as np
 from pycurves_lib.data.modified_bases import is_known_modified_base, parent_base_name
+
+if TYPE_CHECKING:
+    from pycurves_lib.core.curves_dataclasses import CurvesContext
+
 
 class MolecularLoader:
     """
@@ -54,20 +61,22 @@ class MolecularLoader:
         return open(file_path, 'r')
 
     @staticmethod
-    def load(file_path: str, context: 'CurvesContext'):
+    def load(file_path: str, context: 'CurvesContext', altloc=None):
         """
         Main entry point for loading molecular data.
         """
+        altloc = MolecularLoader.normalize_altloc(altloc)
         file_lower = file_path.lower()
 
         if file_lower.endswith('.pdb') or file_lower.endswith('.pdb.gz') or file_lower.endswith('.brk'):
-            MolecularLoader._read_pdb(file_path, context)
+            MolecularLoader._read_pdb(file_path, context, altloc=altloc)
         elif file_lower.endswith('.cif') or file_lower.endswith('.cif.gz'):
-            MolecularLoader._read_cif(file_path, context)
-        elif file_lower.endswith('.mac'):
-            MolecularLoader._read_mac(file_path, context)
+            MolecularLoader._read_cif(file_path, context, altloc=altloc)
         else:
-            raise ValueError(f"Unknown geometry file type: {file_path}")
+            raise ValueError(
+                f"Unsupported geometry file type: {file_path}. "
+                "Use PDB, PDB.GZ, BRK, CIF, or CIF.GZ."
+            )
 
         # Post-processing equivalent to Fortran loops 10 and 12
         MolecularLoader._standardize_and_map(context)
@@ -76,9 +85,81 @@ class MolecularLoader:
         MolecularLoader._build_connectivity(context)
 
     @staticmethod
-    def _read_pdb(file_path: str, context: 'CurvesContext'):
+    def normalize_altloc(altloc):
+        """Normalize an optional explicit alternate-conformation identifier."""
+        if altloc is None:
+            return None
+        value = str(altloc).strip()
+        if value.lower() in {"", "first", "default"}:
+            return None
+        if len(value) != 1 or value in {".", "?", "*"}:
+            raise ValueError(
+                f"Invalid alternate-conformation identifier {altloc!r}; "
+                "use one character such as 'A' or 'B', or omit it for Gemmi's first conformer."
+            )
+        return value
+
+    @staticmethod
+    def _read_pdb(file_path: str, context: 'CurvesContext', altloc=None):
+        """Read PDB with Gemmi, falling back to the legacy fixed-column parser."""
+        try:
+            MolecularLoader._read_pdb_gemmi(file_path, context, altloc=altloc)
+        except (OSError, RuntimeError, ValueError) as exc:
+            warnings.warn(
+                f"Gemmi could not read PDB file {file_path!r}; using the legacy "
+                f"fixed-column parser ({exc}).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            MolecularLoader._read_pdb_legacy(file_path, context, altloc=altloc)
+
+    @staticmethod
+    def _read_pdb_gemmi(file_path: str, context: 'CurvesContext', altloc=None):
+        """Parse the first PDB model through Gemmi."""
+        structure = gemmi.read_structure(file_path)
+        if len(structure) == 0:
+            raise ValueError("the file contains no structural models")
+
+        atoms_data, available_altlocs = MolecularLoader._gemmi_first_model_atoms(
+            structure,
+            altloc=altloc,
+            return_altlocs=True,
+        )
+        atoms_data = MolecularLoader._filter_unfit_modified_residues(atoms_data)
+        if not atoms_data:
+            raise ValueError("the first model contains no supported atom records")
+
+        crystal_cell = None
+        spacegroup_hm = ""
+        if structure.cell.is_crystal():
+            crystal_cell = MolecularLoader._gemmi_cell_tuple(structure)
+            spacegroup_hm = structure.spacegroup_hm
+
+        source_base_pairs = []
+        atoms_data, source_base_pairs = MolecularLoader._append_detected_crystal_mates(
+            atoms_data,
+            source_base_pairs,
+            crystal_cell,
+            spacegroup_hm,
+        )
+
+        info = dict(structure.info)
+        title = MolecularLoader._clean_title(info.get("_struct.title"))
+        MolecularLoader._populate_molecule(
+            context,
+            atoms_data,
+            title=title,
+            crystal_cell=crystal_cell,
+            spacegroup_hm=spacegroup_hm,
+            source_base_pairs=source_base_pairs,
+            altloc_selection=altloc,
+            available_altlocs=available_altlocs,
+        )
+
+    @staticmethod
+    def _read_pdb_legacy(file_path: str, context: 'CurvesContext', altloc=None):
         """
-        Parse PDB ATOM records using the fixed-column layout.
+        Parse PDB ATOM records using the legacy fixed-column layout.
 
         Curves reads the coordinate file as a flat atom stream and reports all
         ATOM records, including protein atoms that are not part of the DNA
@@ -89,6 +170,8 @@ class MolecularLoader:
         title = "No Title"
         crystal_cell = None
         spacegroup_hm = ""
+        source_atom_index = 0
+        available_altlocs = set()
 
         with MolecularLoader._open_file(file_path) as handle:
             for line in handle:
@@ -117,6 +200,8 @@ class MolecularLoader:
                 if not is_atom:
                     if not (is_hetatm and is_known_modified_base(res_name)):
                         continue
+                record_atom_index = source_atom_index
+                source_atom_index += 1
 
                 try:
                     res_id = int(line[22:26])
@@ -127,6 +212,9 @@ class MolecularLoader:
                     ]
                 except ValueError:
                     continue
+                atom_altloc = line[16].strip()
+                if atom_altloc:
+                    available_altlocs.add(atom_altloc)
 
                 atoms_data.append({
                     'name': line[12:16],
@@ -135,7 +223,13 @@ class MolecularLoader:
                     'res_id': res_id,
                     'pos': pos,
                     'het_flag': "H" if is_hetatm else "A",
+                    'insertion_code': line[26].strip(),
+                    'altloc': atom_altloc,
+                    'occupancy': MolecularLoader._pdb_float(line[54:60], 1.0),
+                    'model_id': "1",
+                    'source_atom_index': record_atom_index,
                 })
+        atoms_data = MolecularLoader._select_atom_records_altloc(atoms_data, altloc)
 
         atoms_data = MolecularLoader._filter_unfit_modified_residues(atoms_data)
         source_base_pairs = []
@@ -146,22 +240,19 @@ class MolecularLoader:
             spacegroup_hm,
         )
 
-        context.molecule.mcode = title
-        context.molecule.crystal_cell = crystal_cell
-        context.molecule.spacegroup_hm = spacegroup_hm
-
-        # Populate MolecularStructure
-        n = len(atoms_data)
-        context.molecule.kam = n
-        context.molecule.atom_names = np.array([a['name'] for a in atoms_data])
-        context.molecule.coordinates = np.array([a['pos'] for a in atoms_data])
-        context.molecule.residue_names = np.array([a['res_name'] for a in atoms_data])
-        context.molecule.residue_ids = np.array([a['res_id'] for a in atoms_data])
-        context.molecule.chain_ids = np.array([a['chain_id'] for a in atoms_data])
-        context.molecule.source_base_pairs = source_base_pairs
+        MolecularLoader._populate_molecule(
+            context,
+            atoms_data,
+            title=title,
+            crystal_cell=crystal_cell,
+            spacegroup_hm=spacegroup_hm,
+            source_base_pairs=source_base_pairs,
+            altloc_selection=altloc,
+            available_altlocs=available_altlocs,
+        )
 
     @staticmethod
-    def _read_cif(file_path: str, context: 'CurvesContext'):
+    def _read_cif(file_path: str, context: 'CurvesContext', altloc=None):
         """
         Parse mmCIF files for atomic coordinates using gemmi.
         """
@@ -170,29 +261,15 @@ class MolecularLoader:
             raise ValueError(f"Empty CIF file: {file_path}")
 
         block = doc[-1]
-        title = block.find_value('_struct.title')
-        if title:
-            title = title.strip(' \'"\n\r')
-        else:
-            title = "No Title"
+        title = MolecularLoader._clean_title(block.find_value('_struct.title'))
 
         st = gemmi.make_structure_from_block(block)
 
-        atoms_data = []
-        if len(st) > 0:
-            for chain in st[0]:  # Process only the first model
-                for res in chain:
-                    if res.het_flag == "H" and not is_known_modified_base(res.name):
-                        continue
-                    for atom in res:
-                        atoms_data.append({
-                            'name': atom.name,
-                            'res_name': res.name,
-                            'chain_id': chain.name,
-                            'res_id': res.seqid.num,
-                            'pos': [atom.pos.x, atom.pos.y, atom.pos.z],
-                            'het_flag': res.het_flag,
-                        })
+        atoms_data, available_altlocs = MolecularLoader._gemmi_first_model_atoms(
+            st,
+            altloc=altloc,
+            return_altlocs=True,
+        )
 
         atoms_data = MolecularLoader._filter_unfit_modified_residues(atoms_data)
         source_base_pairs = MolecularLoader._read_cif_base_pair_annotations(block)
@@ -203,20 +280,202 @@ class MolecularLoader:
             block,
         )
 
-        context.molecule.mcode = title
-        context.molecule.crystal_cell = (
-            st.cell.a, st.cell.b, st.cell.c, st.cell.alpha, st.cell.beta, st.cell.gamma
-        ) if len(st) > 0 else None
-        context.molecule.spacegroup_hm = st.spacegroup_hm if len(st) > 0 else ""
+        MolecularLoader._populate_molecule(
+            context,
+            atoms_data,
+            title=title,
+            crystal_cell=MolecularLoader._gemmi_cell_tuple(st) if len(st) > 0 else None,
+            spacegroup_hm=st.spacegroup_hm if len(st) > 0 else "",
+            source_base_pairs=source_base_pairs,
+            altloc_selection=altloc,
+            available_altlocs=available_altlocs,
+        )
 
-        n = len(atoms_data)
-        context.molecule.kam = n
-        context.molecule.atom_names = np.array([a['name'] for a in atoms_data])
-        context.molecule.coordinates = np.array([a['pos'] for a in atoms_data])
-        context.molecule.residue_names = np.array([a['res_name'] for a in atoms_data])
-        context.molecule.residue_ids = np.array([a['res_id'] for a in atoms_data])
-        context.molecule.chain_ids = np.array([a['chain_id'] for a in atoms_data])
-        context.molecule.source_base_pairs = source_base_pairs
+    @staticmethod
+    def _gemmi_first_model_atoms(structure, altloc=None, return_altlocs=False):
+        """Return one coherent conformer from the first Gemmi model.
+
+        With no explicit altloc, Gemmi keeps the first-listed conformer. An
+        explicit identifier keeps blank/shared atoms plus that conformer.
+        """
+        atoms_data = []
+        if len(structure) == 0:
+            return (atoms_data, ()) if return_altlocs else atoms_data
+
+        available_altlocs = tuple(sorted({
+            str(atom.altloc)
+            for chain in structure[0]
+            for residue in chain
+            for atom in residue
+            if str(atom.altloc) not in {"", "\x00", " "}
+        }))
+        altloc = MolecularLoader.normalize_altloc(altloc)
+        if altloc is not None and available_altlocs and altloc not in available_altlocs:
+            raise ValueError(
+                f"Alternate conformation {altloc!r} is not present in the first model; "
+                f"available identifiers: {', '.join(available_altlocs)}."
+            )
+        first_source_indices = {}
+        if altloc is None:
+            original_indices = {}
+            source_index = 0
+            for chain in structure[0]:
+                for residue in chain:
+                    residue_key = (
+                        chain.name,
+                        int(residue.seqid.num),
+                        str(residue.seqid.icode).strip(),
+                        residue.name,
+                    )
+                    for atom in residue:
+                        atom_altloc = str(atom.altloc).replace("\x00", "")
+                        original_indices[(*residue_key, atom.name, atom_altloc)] = source_index
+                        source_index += 1
+                    for atom in residue.first_conformer():
+                        atom_altloc = str(atom.altloc).replace("\x00", "")
+                        first_source_indices[(*residue_key, atom.name)] = original_indices[
+                            (*residue_key, atom.name, atom_altloc)
+                        ]
+            structure.remove_alternative_conformations()
+
+        source_atom_index = 0
+        model_id = str(getattr(structure[0], "name", getattr(structure[0], "num", 1)))
+        for chain in structure[0]:
+            for residue in chain:
+                for atom in residue:
+                    record_atom_index = source_atom_index
+                    source_atom_index += 1
+                    if altloc is None:
+                        record_atom_index = first_source_indices.get(
+                            (
+                                chain.name,
+                                int(residue.seqid.num),
+                                str(residue.seqid.icode).strip(),
+                                residue.name,
+                                atom.name,
+                            ),
+                            record_atom_index,
+                        )
+                    atom_altloc = str(atom.altloc)
+                    if atom_altloc == "\x00":
+                        atom_altloc = ""
+                    if altloc is not None and atom_altloc not in {"", altloc}:
+                        continue
+                    if residue.het_flag != "A" and not is_known_modified_base(residue.name):
+                        continue
+                    atoms_data.append({
+                        "name": atom.name,
+                        "res_name": residue.name,
+                        "chain_id": chain.name,
+                        "res_id": residue.seqid.num,
+                        "pos": [atom.pos.x, atom.pos.y, atom.pos.z],
+                        "het_flag": residue.het_flag,
+                        "insertion_code": str(residue.seqid.icode).strip(),
+                        "altloc": atom_altloc,
+                        "occupancy": float(atom.occ),
+                        "model_id": model_id,
+                        "source_atom_index": record_atom_index,
+                    })
+        if return_altlocs:
+            return atoms_data, available_altlocs
+        return atoms_data
+
+    @staticmethod
+    def _gemmi_cell_tuple(structure):
+        cell = structure.cell
+        return cell.a, cell.b, cell.c, cell.alpha, cell.beta, cell.gamma
+
+    @staticmethod
+    def _clean_title(value):
+        title = str(value or "").strip(' \'"\n\r')
+        return title or "No Title"
+
+    @staticmethod
+    def _populate_molecule(
+        context,
+        atoms_data,
+        *,
+        title,
+        crystal_cell,
+        spacegroup_hm,
+        source_base_pairs,
+        altloc_selection=None,
+        available_altlocs=(),
+    ):
+        molecule = context.molecule
+        molecule.mcode = title
+        molecule.crystal_cell = crystal_cell
+        molecule.spacegroup_hm = spacegroup_hm
+        molecule.kam = len(atoms_data)
+        molecule.atom_names = np.array([atom["name"] for atom in atoms_data])
+        molecule.coordinates = np.array([atom["pos"] for atom in atoms_data])
+        molecule.residue_names = np.array([atom["res_name"] for atom in atoms_data])
+        molecule.residue_ids = np.array([atom["res_id"] for atom in atoms_data])
+        molecule.chain_ids = np.array([atom["chain_id"] for atom in atoms_data])
+        molecule.insertion_codes = np.array([atom.get("insertion_code", "") for atom in atoms_data])
+        molecule.altlocs = np.array([atom.get("altloc", "") for atom in atoms_data])
+        molecule.occupancies = np.array([atom.get("occupancy", 1.0) for atom in atoms_data], dtype=float)
+        molecule.model_ids = np.array([atom.get("model_id", "1") for atom in atoms_data])
+        molecule.source_atom_indices = np.array(
+            [atom.get("source_atom_index", index) for index, atom in enumerate(atoms_data)],
+            dtype=int,
+        )
+        molecule.altloc_selection = altloc_selection or "first"
+        molecule.available_altlocs = tuple(available_altlocs)
+        molecule.source_base_pairs = source_base_pairs
+
+    @staticmethod
+    def _pdb_float(value, default):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _select_atom_records_altloc(atoms_data, altloc):
+        """Apply first-conformer or explicit-altloc selection to legacy PDB records."""
+        altloc = MolecularLoader.normalize_altloc(altloc)
+        if altloc is not None:
+            available = {
+                str(atom.get("altloc", "")).strip()
+                for atom in atoms_data
+                if str(atom.get("altloc", "")).strip()
+            }
+            if available and altloc not in available:
+                raise ValueError(
+                    f"Alternate conformation {altloc!r} is not present; "
+                    f"available identifiers: {', '.join(sorted(available))}."
+                )
+            return [
+                atom for atom in atoms_data
+                if str(atom.get("altloc", "")).strip() in {"", altloc}
+            ]
+
+        first_by_residue = {}
+        for atom in atoms_data:
+            atom_altloc = str(atom.get("altloc", "")).strip()
+            if not atom_altloc:
+                continue
+            key = (
+                str(atom.get("chain_id", "")).strip(),
+                int(atom.get("res_id", 0)),
+                str(atom.get("insertion_code", "")).strip(),
+                str(atom.get("res_name", "")).strip().upper(),
+            )
+            first_by_residue.setdefault(key, atom_altloc)
+
+        selected = []
+        for atom in atoms_data:
+            atom_altloc = str(atom.get("altloc", "")).strip()
+            key = (
+                str(atom.get("chain_id", "")).strip(),
+                int(atom.get("res_id", 0)),
+                str(atom.get("insertion_code", "")).strip(),
+                str(atom.get("res_name", "")).strip().upper(),
+            )
+            if not atom_altloc or atom_altloc == first_by_residue.get(key, atom_altloc):
+                selected.append({**atom, "altloc": ""})
+        return selected
 
     @staticmethod
     def _filter_unfit_modified_residues(atoms_data):
@@ -234,6 +493,7 @@ class MolecularLoader:
             key = (
                 str(atom.get("chain_id", "")).strip(),
                 int(atom.get("res_id", 0)),
+                str(atom.get("insertion_code", "")).strip(),
                 str(atom.get("res_name", "")).strip().upper(),
                 str(atom.get("het_flag", "")),
             )
@@ -245,7 +505,7 @@ class MolecularLoader:
         filtered = []
         for key in order:
             atoms = grouped[key]
-            _, _, residue_name, het_flag = key
+            _, _, _, residue_name, het_flag = key
             if het_flag == "H" and is_known_modified_base(residue_name):
                 atom_names = {MolecularLoader._clean_atom_name(atom["name"]) for atom in atoms}
                 if not MolecularLoader._has_minimal_base_frame_atoms(residue_name, atom_names):
@@ -775,22 +1035,6 @@ class MolecularLoader:
         return frozenset((first, second)) in MolecularLoader.PAIR_TYPES
 
     @staticmethod
-    def _read_mac(file_path: str, context: 'CurvesContext'):
-        """
-        Parses the Curves-specific .MAC format [cite: 4-5].
-        """
-        with MolecularLoader._open_file(file_path) as f:
-            lines = [line for line in f if not line.startswith('#')]
-            # Read kam and kcen from header [cite: 4]
-            header = lines[0].split()
-            kam = int(header[0])
-            context.molecule.kam = kam
-
-            # Implementation of fixed-format read for MAC [cite: 5]
-            # (Simplified for demonstration)
-            pass
-
-    @staticmethod
     def _find_subunits(context: 'CurvesContext'):
         """
         Detects subunit boundaries based on residue name/ID changes [cite: 9-10].
@@ -800,21 +1044,25 @@ class MolecularLoader:
         res_names = mol.residue_names
         res_ids = mol.residue_ids
         chain_ids = mol.chain_ids if mol.chain_ids is not None else np.full(mol.kam, "")
+        insertion_codes = mol.insertion_codes if mol.insertion_codes is not None else np.full(mol.kam, "")
 
         boundaries = [0]
         if mol.kam > 0:
             current_name = res_names[0]
             current_id = res_ids[0]
             current_chain = chain_ids[0]
+            current_insertion = insertion_codes[0]
 
             for i in range(1, mol.kam):
                 if (res_names[i] != current_name or
                         res_ids[i] != current_id or
-                        chain_ids[i] != current_chain):
+                        chain_ids[i] != current_chain or
+                        insertion_codes[i] != current_insertion):
                     boundaries.append(i) # Store index before new subunit starts
                     current_name = res_names[i]
                     current_id = res_ids[i]
                     current_chain = chain_ids[i]
+                    current_insertion = insertion_codes[i]
             boundaries.append(mol.kam)
 
         mol.subunit_boundaries = np.array(boundaries)
@@ -832,9 +1080,29 @@ class MolecularLoader:
         pairs = tree.query_pairs(threshold)
 
         connectivity = np.zeros((len(coords), 7), dtype=int)
+        subunit_by_atom = np.full(len(coords), -1, dtype=int)
+        for subunit in range(mol.kcen):
+            start = int(mol.subunit_boundaries[subunit])
+            stop = int(mol.subunit_boundaries[subunit + 1])
+            subunit_by_atom[start:stop] = subunit
+
         counts = np.zeros(len(coords), dtype=int)
 
         for i, j in pairs:
+            same_subunit = subunit_by_atom[i] == subunit_by_atom[j]
+            if not same_subunit:
+                same_chain = str(mol.chain_ids[i]).strip() == str(mol.chain_ids[j]).strip()
+                adjacent_subunits = abs(int(subunit_by_atom[i]) - int(subunit_by_atom[j])) == 1
+                names = {
+                    MolecularLoader._clean_atom_name(mol.atom_names[i]),
+                    MolecularLoader._clean_atom_name(mol.atom_names[j]),
+                }
+                is_phosphodiester = names in ({"O3'", "P"}, {"O3*", "P"})
+                if not (same_chain and adjacent_subunits and is_phosphodiester):
+                    continue
+            if mol.model_ids is not None and mol.model_ids[i] != mol.model_ids[j]:
+                continue
+
             if counts[i] < 6:
                 connectivity[i, counts[i]] = j + 1
                 counts[i] += 1
@@ -862,13 +1130,19 @@ class MolecularLoader:
                 indices['v1_ref'] = i
 
             if is_purine:
-                if name == 'N9': indices['base_origin_ref'] = i
-                if name == 'C4': indices['v2_ref'] = i
-                if name == 'C8': indices['v3_ref'] = i
+                if name == 'N9':
+                    indices['base_origin_ref'] = i
+                if name == 'C4':
+                    indices['v2_ref'] = i
+                if name == 'C8':
+                    indices['v3_ref'] = i
             else:
-                if name == 'N1': indices['base_origin_ref'] = i
-                if name == 'C2': indices['v2_ref'] = i
-                if name == 'C6': indices['v3_ref'] = i
+                if name == 'N1':
+                    indices['base_origin_ref'] = i
+                if name == 'C2':
+                    indices['v2_ref'] = i
+                if name == 'C6':
+                    indices['v3_ref'] = i
 
         if len(indices) < 4:
             return None

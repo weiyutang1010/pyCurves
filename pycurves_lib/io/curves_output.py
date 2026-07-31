@@ -84,6 +84,14 @@ def _json_number(value):
         return None
     return number if np.isfinite(number) else None
 
+def _backbone_number(value):
+    """Return None for non-finite values and the legacy Curves 999 sentinel."""
+    number = _json_number(value)
+    if number is None or number >= 900.0:
+        return None
+    return number
+
+
 
 class CurvesOutputFormatter(VisualizationPayloadMixin):
     """Render pyCurves results as Curves-style text or structured JSON/Pandas."""
@@ -186,7 +194,7 @@ class CurvesOutputFormatter(VisualizationPayloadMixin):
 
     def _frame_convention_payload(self) -> Dict[str, Any]:
         cfg = self.runner.ctx.cfg
-        name = getattr(cfg, "frame_convention", "legacy")
+        name = getattr(cfg, "frame_convention", "standard")
         library = getattr(self.runner.ctx, "base_reference_library", None)
         return {
             "name": name,
@@ -203,6 +211,8 @@ class CurvesOutputFormatter(VisualizationPayloadMixin):
             "ends": bool(getattr(cfg, "ends", False)),
             "mini": bool(getattr(cfg, "mini", False)),
             "axis_convention": getattr(cfg, "axis_convention", "legacy"),
+            "altloc": getattr(self.runner.ctx.molecule, "altloc_selection", "first"),
+            "available_altlocs": list(getattr(self.runner.ctx.molecule, "available_altlocs", ())),
         }
 
     def _sequence_payload(self) -> Dict[str, Any]:
@@ -226,6 +236,7 @@ class CurvesOutputFormatter(VisualizationPayloadMixin):
                     "residue_name": residue_name,
                     "parent_base": parent_base,
                     "residue_id": int(ctx.molecule.residue_ids[atom_idx]),
+                    "insertion_code": str(ctx.molecule.insertion_codes[atom_idx]).strip() if ctx.molecule.insertion_codes is not None else "",
                     # Per-base standard frame [x_axis, y_axis, z_axis, origin]
                     # (4x3). Same source the live engine passes to DeepPBS's
                     # makeDNACG for degraded-base groove reconstruction; cached
@@ -450,39 +461,83 @@ class CurvesOutputFormatter(VisualizationPayloadMixin):
         backbone = []
         for strand in range(ctx.nst):
             for level in range(1, ctx.nux + 1):
-                if not calc._has_level(strand, level): continue
-                label = calc._residue_unit_label(strand, level)
-                if label is None: continue
-                res_name, res_id = label
+                if not calc._has_level(strand, level):
+                    missing = [
+                        "c1_c2", "c2_c3", "phase", "amplitude", "c1_prime", "c2_prime",
+                        "c3_prime", "chi", "gamma", "delta", "epsilon", "zeta", "alpha", "beta",
+                    ]
+                    backbone.append({
+                        "strand": strand + 1,
+                        "level": level,
+                        "residue_name": None,
+                        "residue_id": None,
+                        "chain_id": None,
+                        "insertion_code": None,
+                        "gap": True,
+                        "valid": False,
+                        "status": "gap",
+                        "warnings": ["topology_gap", "missing_parameter_values"],
+                        "missing_parameters": missing,
+                        "pucker": None,
+                        **{name: None for name in missing},
+                    })
+                    continue
+                subunit = abs(int(ctx.ni_map[strand, level - 1]))
+                atom_idx = int(ctx.molecule.subunit_boundaries[subunit - 1])
+                res_name = str(ctx.molecule.residue_names[atom_idx]).strip()
+                res_id = int(ctx.molecule.residue_ids[atom_idx])
+                chain_id = str(ctx.molecule.chain_ids[atom_idx]).strip() if ctx.molecule.chain_ids is not None else ""
+                insertion_code = str(ctx.molecule.insertion_codes[atom_idx]).strip() if ctx.molecule.insertion_codes is not None else ""
 
                 tor = ctx.backbone.torsions[strand, level]
                 pucker = ctx.backbone.sugar_pucker[strand, level]
-                phase = _json_number(pucker[1])
-                pucker_index = 0
+                phase = _backbone_number(pucker[1])
+                pucker_label = None
                 if phase is not None:
                     pucker_index = int((phase % 360.0) / 36.0)
                     pucker_index = max(0, min(len(SUGAR_PUCKERS) - 1, pucker_index))
-                backbone.append({
+                    pucker_label = SUGAR_PUCKERS[pucker_index]
+                row = {
                     "strand": strand + 1,
                     "level": level,
                     "residue_name": res_name,
                     "residue_id": res_id,
-                    "c1_c2": _json_number(tor[4]),
-                    "c2_c3": _json_number(tor[5]),
+                    "chain_id": chain_id,
+                    "insertion_code": insertion_code,
+                    "gap": False,
+                    "c1_c2": _backbone_number(tor[4]),
+                    "c2_c3": _backbone_number(tor[5]),
                     "phase": phase,
-                    "amplitude": _json_number(pucker[0]),
-                    "pucker": SUGAR_PUCKERS[pucker_index],
-                    "c1_prime": _json_number(tor[0]),
-                    "c2_prime": _json_number(tor[1]),
-                    "c3_prime": _json_number(tor[2]),
-                    "chi": _json_number(tor[12]),
-                    "gamma": _json_number(tor[8]),
-                    "delta": _json_number(tor[9]),
-                    "epsilon": _json_number(tor[6]),
-                    "zeta": _json_number(tor[7]),
-                    "alpha": _json_number(tor[10]),
-                    "beta": _json_number(tor[11]),
+                    "amplitude": _backbone_number(pucker[0]),
+                    "pucker": pucker_label,
+                    "c1_prime": _backbone_number(tor[0]),
+                    "c2_prime": _backbone_number(tor[1]),
+                    "c3_prime": _backbone_number(tor[2]),
+                    "chi": _backbone_number(tor[12]),
+                    "gamma": _backbone_number(tor[8]),
+                    "delta": _backbone_number(tor[9]),
+                    "epsilon": _backbone_number(tor[6]),
+                    "zeta": _backbone_number(tor[7]),
+                    "alpha": _backbone_number(tor[10]),
+                    "beta": _backbone_number(tor[11]),
+                }
+                parameter_names = (
+                    "c1_c2", "c2_c3", "phase", "amplitude", "c1_prime", "c2_prime",
+                    "c3_prime", "chi", "gamma", "delta", "epsilon", "zeta", "alpha", "beta",
+                )
+                missing_parameters = [name for name in parameter_names if row[name] is None]
+                warnings = []
+                if bool(ctx.backbone.flag[strand, level]):
+                    warnings.append("incomplete_sugar_geometry")
+                if missing_parameters:
+                    warnings.append("missing_parameter_values")
+                row.update({
+                    "valid": not warnings,
+                    "status": "complete" if not warnings else "partial",
+                    "warnings": warnings,
+                    "missing_parameters": missing_parameters,
                 })
+                backbone.append(row)
         records["backbone"] = backbone
         if not curvesplus_axis:
             records["global_axis_curvature"] = self._axis_curvature_records()
@@ -506,7 +561,7 @@ class CurvesOutputFormatter(VisualizationPayloadMixin):
     def _uses_curvesplus_axis(self) -> bool:
         cfg = self.runner.ctx.cfg
         return (
-            str(getattr(cfg, "frame_convention", "legacy")).lower() == "standard"
+            str(getattr(cfg, "frame_convention", "standard")).lower() == "standard"
             and str(getattr(cfg, "axis_convention", "legacy")).lower() == "curvesplus"
         )
 
@@ -637,7 +692,15 @@ class CurvesOutputFormatter(VisualizationPayloadMixin):
                 "base_2": row.get("base_2"),
                 "edge_pair": row.get("edge_pair", ""),
                 "glycosidic_orientation": row.get("glycosidic_orientation", ""),
+                "glycosidic_conformation_1": row.get("glycosidic_conformation_1", ""),
+                "glycosidic_conformation_2": row.get("glycosidic_conformation_2", ""),
+                "lw_default_strand_orientation": row.get("lw_default_strand_orientation", ""),
+                "lw_strand_orientation": row.get("lw_strand_orientation", ""),
+                "syn_orientation_reversal": bool(row.get("syn_orientation_reversal", False)),
+                "effective_local_orientation": row.get("effective_local_orientation", ""),
                 "strand_direction": row.get("strand_direction", ""),
+                "topology_strand_direction": row.get("topology_strand_direction", ""),
+                "partner_frame_transform": row.get("partner_frame_transform", ""),
                 "frame_mode": row.get("frame_mode", ""),
                 "contact_confidence": row.get("contact_confidence", ""),
                 "contact_count": self._contact_count(row),
@@ -678,7 +741,15 @@ class CurvesOutputFormatter(VisualizationPayloadMixin):
                 "edge_1": row.get("edge_1", ""),
                 "edge_2": row.get("edge_2", ""),
                 "glycosidic_orientation": row.get("glycosidic_orientation", ""),
+                "glycosidic_conformation_1": row.get("glycosidic_conformation_1", ""),
+                "glycosidic_conformation_2": row.get("glycosidic_conformation_2", ""),
+                "lw_default_strand_orientation": row.get("lw_default_strand_orientation", ""),
+                "lw_strand_orientation": row.get("lw_strand_orientation", ""),
+                "syn_orientation_reversal": bool(row.get("syn_orientation_reversal", False)),
+                "effective_local_orientation": row.get("effective_local_orientation", ""),
                 "strand_direction": row.get("strand_direction", ""),
+                "topology_strand_direction": row.get("topology_strand_direction", ""),
+                "partner_frame_transform": row.get("partner_frame_transform", ""),
                 "frame_mode": row.get("frame_mode", ""),
                 "contact_confidence": row.get("contact_confidence", ""),
                 "contact_count": self._contact_count(row),
@@ -699,6 +770,7 @@ class CurvesOutputFormatter(VisualizationPayloadMixin):
             or row.get("pair_family") not in {"watson_crick", ""}
             or row.get("geometry_flag")
             or row.get("frame_mode") == "contact_geometry"
+            or row.get("syn_orientation_reversal")
         )
 
     @staticmethod

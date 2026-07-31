@@ -34,6 +34,7 @@ all = [
 ]
 dev = [
   "build>=1.0",
+  "pytest>=8.0",
 ]
 
 [project.scripts]
@@ -42,6 +43,7 @@ pycurves-md = "pycurves_md:main"
 pycurves-md-batch = "pycurves_md_batch:main"
 pycurves-md-plot = "pycurves_md_plot:main"
 pycurves-viewer = "pycurves_viewer:main"
+pycurves-pymol = "pycurves_pymol:main"
 
 [tool.setuptools]
 py-modules = [
@@ -50,6 +52,7 @@ py-modules = [
   "pycurves_md_batch",
   "pycurves_md_plot",
   "pycurves_viewer",
+  "pycurves_pymol",
   "process_dna",
 ]
 include-package-data = true

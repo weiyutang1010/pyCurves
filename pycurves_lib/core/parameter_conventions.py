@@ -6,7 +6,11 @@ from typing import Optional
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from pycurves_lib.topology.base_annotations import BASE_EDGE_ATOMS
+from pycurves_lib.topology.base_annotations import (
+    BASE_EDGE_ATOMS,
+    effective_lw_strand_orientation,
+    infer_lw_strand_orientation,
+)
 
 EQUIVALENT_AXIS_SIGN_FLIPS = (
     np.diag([1.0, 1.0, 1.0]),
@@ -66,51 +70,73 @@ def build_axis_reference_frames(ctx):
     """Build the frame view consumed by the legacy global-axis optimizer.
 
     Noncanonical edge frames can be fit on a discontinuous in-plane branch.
-    Choose determinant-preserving sign equivalents so the legacy global-axis
-    optimizer sees continuous reference frames.
+    Choose determinant-preserving sign equivalents for those contact-geometry
+    frames only. Fitted canonical frames are fixed anchors: allowing an
+    adjusted contact frame to become the reference for the following residue
+    can propagate a sign branch across the rest of a strand.
     """
     p = ctx.params
     shape_frames = build_interaction_reference_frames(ctx)
     axis_frames = shape_frames.copy()
 
-    markers = getattr(ctx, "hoogsteen_markers", set()) or set()
-    annotations = getattr(ctx, "annotations", {}).get("base_pair_annotations", [])
-    has_contact_geometry = bool(getattr(ctx, "contact_geometry_frame_keys", set()))
-    has_hoogsteen = bool(markers) or any(bp.get("is_hoogsteen") for bp in annotations)
-    needs_continuity = has_contact_geometry or has_hoogsteen
-    ctx.axis_reference_uses_continuity = bool(needs_continuity)
-    if not needs_continuity:
+    contact_levels = {
+        (int(strand), int(level))
+        for strand, _partner, level in (getattr(ctx, "contact_geometry_frame_keys", set()) or set())
+        if 0 <= int(strand) < ctx.nst and 1 <= int(level) <= ctx.nux
+    }
+    ctx.axis_reference_uses_continuity = bool(contact_levels)
+    if not contact_levels:
         p.axis_frames = axis_frames
         ctx.axis_frame_adjustments = []
         return axis_frames
 
     adjustments = []
-    for strand in range(ctx.nst):
-        previous_axes = None
-        for level in range(0, ctx.nux + 2):
-            if level >= ctx.li.shape[0] or ctx.li[level, strand] < 0:
-                previous_axes = None
-                continue
-            current = shape_frames[strand, level]
-            if not np.all(np.isfinite(current)):
-                previous_axes = None
-                continue
+    for strand, level in sorted(contact_levels):
+        current = shape_frames[strand, level]
+        if ctx.li[level, strand] < 0 or not np.all(np.isfinite(current)):
+            continue
 
-            axes = current[:3].copy()
-            if previous_axes is not None:
-                candidates = [sign_flip @ axes for sign_flip in EQUIVALENT_AXIS_SIGN_FLIPS]
-                scores = [float(np.trace(previous_axes @ candidate.T)) for candidate in candidates]
-                best_index = int(np.argmax(scores))
-                axes = candidates[best_index]
-                axis_frames[strand, level, :3, :] = axes
-                if best_index != 0:
-                    adjustments.append((strand + 1, level))
+        anchors = _nearest_fitted_axis_anchors(
+            ctx,
+            shape_frames,
+            contact_levels,
+            strand,
+            level,
+        )
+        if not anchors:
+            continue
 
-            previous_axes = axes
+        axes = current[:3].copy()
+        candidates = [sign_flip @ axes for sign_flip in EQUIVALENT_AXIS_SIGN_FLIPS]
+        scores = [
+            sum(float(np.trace(anchor @ candidate.T)) for anchor in anchors)
+            for candidate in candidates
+        ]
+        best_index = int(np.argmax(scores))
+        axis_frames[strand, level, :3, :] = candidates[best_index]
+        if best_index != 0:
+            adjustments.append((strand + 1, level))
 
     p.axis_frames = axis_frames
     ctx.axis_frame_adjustments = adjustments
     return axis_frames
+
+
+def _nearest_fitted_axis_anchors(ctx, frames, contact_levels, strand: int, level: int):
+    """Return the nearest fixed frame on either side of a contact-frame run."""
+    anchors = []
+    for direction in (-1, 1):
+        neighbor = level + direction
+        while 1 <= neighbor <= ctx.nux:
+            if ctx.li[neighbor, strand] < 0:
+                break
+            if (strand, neighbor) not in contact_levels:
+                frame = frames[strand, neighbor]
+                if np.all(np.isfinite(frame)):
+                    anchors.append(frame[:3])
+                break
+            neighbor += direction
+    return anchors
 
 
 def _has_level(ctx, strand: int, level: int) -> bool:
@@ -213,7 +239,11 @@ def _edge_points_for_frame(base: str, edge: str, atom_map: dict, contact_atoms) 
     return np.asarray([atom_map[name] for name in names if name in atom_map], dtype=float)
 
 
-def _interaction_member_reference_frame(raw_frame: np.ndarray, edge_points: np.ndarray, hbond_axis: np.ndarray) -> np.ndarray:
+def _interaction_member_reference_frame(
+    raw_frame: np.ndarray,
+    edge_points: np.ndarray,
+    hbond_axis: np.ndarray,
+) -> np.ndarray:
     """Return one base's observed-edge interaction frame."""
     edge_points = np.asarray(edge_points, dtype=float)
     z_axis = _unit(raw_frame[2], np.array([0.0, 0.0, 1.0]))
@@ -530,15 +560,14 @@ class LegacyParameterConvention(BaseParameterConvention):
                 current_pair = standard._base_pair_frame(calc, partner_strand, level)
                 if previous_pair is None or current_pair is None:
                     continue
-                previous_pair, current_pair = standard._step_aligned_frames(previous_pair, current_pair, calc.cdr)
-                values = standard._rigid_body_values(
-                    previous_pair,
-                    current_pair,
-                    calc.cdr,
-                    translation_sign=1.0,
-                    rotation_sign=1.0,
-                )
-                values[3:] = [standard._wrap_180(value) for value in values[3:]]
+                if (
+                    standard._uses_contact_geometry_pair(calc, partner_strand, level - 1)
+                    or standard._uses_contact_geometry_pair(calc, partner_strand, level)
+                ):
+                    previous_pair, current_pair = standard._step_aligned_frames(
+                        previous_pair, current_pair, calc.cdr
+                    )
+                values = standard._curvesplus_step_values(previous_pair, current_pair, calc.cdr)
                 calc.pab[level, :, partner_strand] = values
 
 
@@ -571,14 +600,24 @@ class StandardParameterConvention(LegacyParameterConvention):
                 current_pair = self._base_pair_frame(calc, partner_strand, level)
                 if previous_pair is None or current_pair is None:
                     continue
-                previous_pair, current_pair = self._step_aligned_frames(previous_pair, current_pair, calc.cdr)
+                # Contact-geometry frames can require a determinant-preserving
+                # branch selection. Fitted canonical frames are fixed: Curves+
+                # handles a reverse Z step by changing Rise and Twist below,
+                # not by rotating both base-pair frames by 180 degrees.
+                if (
+                    self._uses_contact_geometry_pair(calc, partner_strand, level - 1)
+                    or self._uses_contact_geometry_pair(calc, partner_strand, level)
+                ):
+                    previous_pair, current_pair = self._step_aligned_frames(
+                        previous_pair,
+                        current_pair,
+                        calc.cdr,
+                    )
 
-                calc.pab[level, :, partner_strand] = self._rigid_body_values(
+                calc.pab[level, :, partner_strand] = self._curvesplus_step_values(
                     previous_pair,
                     current_pair,
                     calc.cdr,
-                    translation_sign=1.0,
-                    rotation_sign=1.0,
                 )
 
     def fill_local_strand_steps(self, calc) -> None:
@@ -696,6 +735,35 @@ class StandardParameterConvention(LegacyParameterConvention):
         best = max(top, key=lambda item: (item[1], item[2], item[3], item[4]))
         return best[5], best[6]
 
+    def _curvesplus_step_values(
+        self,
+        previous: ParameterFrame,
+        current: ParameterFrame,
+        degrees_per_radian: float,
+    ) -> np.ndarray:
+        """Return Curves+ inter-base-pair parameters for two mean frames.
+
+        ``params.f`` keeps the midpoint-frame decomposition intact. When the
+        displacement points against the upper base-pair normal, only Rise and
+        Twist are put on the forward-Z branch; Slide and Roll are unchanged.
+        """
+        values = np.asarray(
+            self._rigid_body_values(
+                previous,
+                current,
+                degrees_per_radian,
+                translation_sign=1.0,
+                rotation_sign=1.0,
+            ),
+            dtype=float,
+        )
+        delta = current.origin - previous.origin
+        if float(np.dot(delta, current.axes[2])) < 0.0:
+            values[2] = -values[2]
+            values[5] = -values[5]
+        values[3:] = [self._wrap_180(value) for value in values[3:]]
+        return values
+
     def _equivalent_frame_variants(self, frame: ParameterFrame):
         for sign_flip in self._EQUIVALENT_AXIS_SIGN_FLIPS:
             yield ParameterFrame(origin=frame.origin.copy(), axes=sign_flip @ frame.axes)
@@ -704,23 +772,49 @@ class StandardParameterConvention(LegacyParameterConvention):
         contact_geometry = self._contact_geometry_for_pair(calc, partner_strand, level)
         annotation = self._base_pair_annotation(calc, partner_strand, level)
         annotated_geometry = (annotation or {}).get("contact_geometry") or {}
-        if contact_geometry is not None:
-            glycosidic_orientation = str(contact_geometry.get("glycosidic_orientation", "")).lower()
-            if glycosidic_orientation in {"cis", "c"}:
-                prefer_parallel = True
-            elif glycosidic_orientation in {"trans", "t"}:
-                prefer_parallel = False
-            else:
-                prefer_parallel = contact_geometry.get("strand_direction") == "parallel"
-        else:
-            prefer_parallel = self._is_hoogsteen_pair(calc, partner_strand, level)
+        pair_geometry = contact_geometry or annotated_geometry
+        partner_frame_transform = str(pair_geometry.get("partner_frame_transform") or "").lower()
+        effective_orientation = str(pair_geometry.get("effective_local_orientation") or "").lower()
+        lw_default_orientation = str(
+            pair_geometry.get("lw_default_strand_orientation")
+            or pair_geometry.get("lw_strand_orientation")
+            or ""
+        ).lower()
+        if not lw_default_orientation:
+            lw_default_orientation = infer_lw_strand_orientation(
+                pair_geometry.get("glycosidic_orientation", ""),
+                pair_geometry.get("edge_1", ""),
+                pair_geometry.get("edge_2", ""),
+            )
+        if not effective_orientation and lw_default_orientation:
+            effective_orientation, _ = effective_lw_strand_orientation(
+                lw_default_orientation,
+                pair_geometry.get("glycosidic_conformation_1", "anti"),
+                pair_geometry.get("glycosidic_conformation_2", "anti"),
+            )
+        if not effective_orientation:
+            effective_orientation = str(pair_geometry.get("strand_direction") or "").lower()
         first = self._base_frame(calc, 0, level)
         other = self._base_frame(calc, partner_strand, level)
         if first is None or other is None:
             return None
-        if self._is_noncanonical_watson_pair(annotation, annotated_geometry):
-            other = self._closest_partner_frame(first, other)
+        # LW orientation controls the coordinate-frame branch. A single-syn
+        # reversal is topology metadata; the fitted/contact frame already
+        # contains that rotation, so applying it here would double-count syn.
+        if lw_default_orientation == "antiparallel":
+            other = self._inverted_partner_frame(other)
+        elif lw_default_orientation == "parallel":
+            other = ParameterFrame(origin=other.origin.copy(), axes=other.axes.copy())
+        elif partner_frame_transform == "yz_inverted":
+            other = self._inverted_partner_frame(other)
+        elif partner_frame_transform == "direct":
+            other = ParameterFrame(origin=other.origin.copy(), axes=other.axes.copy())
+        elif effective_orientation == "antiparallel":
+            other = self._inverted_partner_frame(other)
+        elif effective_orientation == "parallel":
+            other = ParameterFrame(origin=other.origin.copy(), axes=other.axes.copy())
         else:
+            prefer_parallel = self._is_hoogsteen_pair(calc, partner_strand, level)
             other = self._aligned_partner_frame(first, other, prefer_parallel=prefer_parallel)
         return first, other
 
@@ -849,13 +943,6 @@ class StandardParameterConvention(LegacyParameterConvention):
             return inverted
         return ParameterFrame(origin=other.origin.copy(), axes=other.axes.copy())
 
-    def _closest_partner_frame(self, first: ParameterFrame, other: ParameterFrame) -> ParameterFrame:
-        direct = ParameterFrame(origin=other.origin.copy(), axes=other.axes.copy())
-        inverted = self._inverted_partner_frame(other)
-        direct_score = float(np.trace(first.axes @ direct.axes.T))
-        inverted_score = float(np.trace(first.axes @ inverted.axes.T))
-        return inverted if inverted_score > direct_score + 1e-9 else direct
-
     @staticmethod
     def _inverted_partner_frame(frame: ParameterFrame) -> ParameterFrame:
         axes = frame.axes.copy()
@@ -911,7 +998,7 @@ class StandardParameterConvention(LegacyParameterConvention):
 
 
 def convention_for_context(ctx) -> BaseParameterConvention:
-    name = str(getattr(ctx.cfg, "frame_convention", "legacy")).strip().lower()
+    name = str(getattr(ctx.cfg, "frame_convention", "standard")).strip().lower()
     if name in {"standard", "curves_plus", "curves+", "curvesplus", "x3dna", "3dna"}:
         return StandardParameterConvention()
     return LegacyParameterConvention()

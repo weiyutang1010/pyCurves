@@ -7,7 +7,6 @@ from pycurves_lib.curves_wrapper import CurvesWrapper
 from pycurves_lib.cli.pycurves_cli_options import (
     add_pycurves_analysis_options,
     pycurves_runner_kwargs,
-    resolved_mini,
 )
 
 
@@ -126,9 +125,8 @@ def main():
 
     if not args.input:
         raise SystemExit("No input file provided.")
-    
+
     runner_kwargs = pycurves_runner_kwargs(args)
-    mini_override = resolved_mini(args, default=True)
 
     if args.generate_inp_only:
         _generate_inp_only(args, runner_kwargs)
@@ -158,7 +156,7 @@ def main():
             for inpfile in runner.generated_inpfiles:
                 print(f"  {inpfile}", file=stream)
 
-    runner.run(output=False, mini=mini_override, verbose=args.verbose_opt and not args.quiet_opt)
+    runner.run(output=False, mini=args.mini, verbose=args.verbose_opt and not args.quiet_opt)
     include_annotations = not args.no_annotations
     
     if not args.no_output:
