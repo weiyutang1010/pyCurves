@@ -3,31 +3,51 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 from tqdm import tqdm
+
+try:
+    import msgspec
+except ImportError:  # pragma: no cover - exercised by minimal installations
+    msgspec = None
 
 from pycurves_lib.io.curves_output import _to_jsonable
 from pycurves_lib.md.trajectory_loader import TrajectoryLoader
 from pycurves_lib.md.trajectory_statistics import (
     BatchSummaryAccumulator,
 )
+from pycurves_lib.md.batch_curvesplus import BatchCurvesPlusMDAnalyzer
+
 from pycurves_md import MDTrajectoryAnalyzer, make_frame_selector
+
+
+def _encode_json(value) -> bytes:
+    if msgspec is not None:
+        return msgspec.json.encode(value)
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
 
 
 def _flush_batch(
     analyzer: BatchCurvesPlusMDAnalyzer,
-    coordinates: List[np.ndarray],
-    frame_indices: List[int],
-    times: List[Optional[float]],
+    coordinates: Sequence[np.ndarray] | np.ndarray,
+    frame_indices: Sequence[int],
+    times: Sequence[Optional[float]],
     mode: str,
     frame_payloads: List[Dict],
     summary_accumulator: Optional[BatchSummaryAccumulator] = None,
+    frame_sink: Optional[Callable[[List[Dict]], None]] = None,
 ) -> int:
-    if not coordinates:
+    if len(coordinates) == 0:
         return 0
     batch_coordinates = np.asarray(coordinates, dtype=float)
     if mode == "summary" and summary_accumulator is not None:
@@ -38,9 +58,13 @@ def _flush_batch(
         frame_indices,
         times,
         accumulator=summary_accumulator if mode == "both" else None,
+        collect_table_records=False,
     )
     if mode in {"per-frame", "both"}:
-        frame_payloads.extend(batch_frames)
+        if frame_sink is None:
+            frame_payloads.extend(batch_frames)
+        else:
+            frame_sink(batch_frames)
     return len(coordinates)
 
 
@@ -67,9 +91,7 @@ def _write_csv_payload(payload: Dict, prefix: str) -> None:
             MDTrajectoryAnalyzer._write_rows_csv(f"{prefix}_{name}_frames.csv", rows)
 
 
-def run_batch(args) -> Dict:
-    from pycurves_lib.md.batch_curvesplus import BatchCurvesPlusMDAnalyzer
-
+def run_batch(args, frame_sink: Optional[Callable[[List[Dict]], None]] = None) -> Dict:
     if args.axis_convention.lower().replace("-", "_") not in {"curvesplus", "curves_plus", "curves+", "canal"}:
         raise SystemExit("pycurves-md-batch currently supports only --axis-convention curvesplus.")
     if args.frame_convention.lower().replace("-", "_") not in {"standard", "curvesplus", "curves_plus", "curves+", "x3dna", "3dna"}:
@@ -90,44 +112,28 @@ def run_batch(args) -> Dict:
         include_grooves=args.grooves,
         include_curvesplus_axis_steps=args.curvesplus_axis_steps,
         include_fit_quality=args.fit_quality,
+        axis_weighting=args.axis_weighting,
         altloc=args.altloc,
     )
 
     frame_payloads: List[Dict] = []
     summary_accumulator = BatchSummaryAccumulator() if args.mode in {"summary", "both"} else None
-    coordinates: List[np.ndarray] = []
-    frame_indices: List[int] = []
-    times: List[Optional[float]] = []
     processed = 0
 
-    iterator = TrajectoryLoader.iter_frames(args.topology, args.trajectory, frame_selector)
-    for frame in tqdm(iterator, desc="Processing frames in batches"):
-        coordinates.append(np.asarray(frame.coordinates, dtype=float))
-        frame_indices.append(int(frame.index))
-        times.append(None if frame.time is None else float(frame.time))
-        if len(coordinates) >= args.batch_size:
-            processed += _flush_batch(
-                analyzer,
-                coordinates,
-                frame_indices,
-                times,
-                args.mode,
-                frame_payloads,
-                summary_accumulator,
-            )
-            coordinates.clear()
-            frame_indices.clear()
-            times.clear()
-
-    processed += _flush_batch(
-        analyzer,
-        coordinates,
-        frame_indices,
-        times,
-        args.mode,
-        frame_payloads,
-        summary_accumulator,
+    iterator = TrajectoryLoader.iter_batches(
+        args.topology, args.trajectory, frame_selector, args.batch_size
     )
+    for batch in tqdm(iterator, desc="Processing frame batches", unit="batch"):
+        processed += _flush_batch(
+            analyzer,
+            batch.coordinates,
+            batch.indices,
+            batch.times,
+            args.mode,
+            frame_payloads,
+            summary_accumulator,
+            frame_sink,
+        )
     if processed == 0:
         raise SystemExit("No trajectory frames matched the requested frame selection.")
 
@@ -150,6 +156,7 @@ def run_batch(args) -> Dict:
             "ends": False if args.ends is None else args.ends,
             "mini": False,
             "axis_convention": "curvesplus",
+            "axis_weighting": bool(analyzer.ctx.cfg.axis_weighting),
             "grooves": analyzer.include_grooves,
             "curvesplus_axis_steps": args.curvesplus_axis_steps,
             "fit_quality": args.fit_quality,
@@ -157,20 +164,75 @@ def run_batch(args) -> Dict:
         "selection": {
             **selection,
             "processed_frames": processed,
-            "engine": "experimental_batch_curvesplus",
+            "engine": "batch_curvesplus",
         },
         "frame_convention": {
             "name": "standard",
             "compatible_with": ["Curves+", "3DNA", "x3dna"],
             "axis_convention": "curvesplus",
         },
-        "annotations_enabled": False,
     }
-    if args.mode in {"per-frame", "both"}:
+    if args.mode in {"per-frame", "both"} and frame_sink is None:
         payload["frames"] = frame_payloads
     if args.mode in {"summary", "both"}:
         payload["summary"] = summary_accumulator.to_summary() if summary_accumulator is not None else {}
     return payload
+
+
+def _write_streamed_json(args) -> Dict:
+    """Write frame batches as they finish, then atomically publish the JSON file."""
+    output_path = Path(args.output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Optional[Path] = None
+
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            stream.write(b"{")
+            first_member = True
+            frame_sink = None
+
+            if args.mode in {"per-frame", "both"}:
+                stream.write(b'"frames":[')
+                first_frame = True
+
+                def write_frames(frames: List[Dict]) -> None:
+                    nonlocal first_frame
+                    if not frames:
+                        return
+                    if not first_frame:
+                        stream.write(b",")
+                    stream.write(_encode_json(frames)[1:-1])
+                    first_frame = False
+
+                frame_sink = write_frames
+                first_member = False
+
+            payload = run_batch(args, frame_sink=frame_sink)
+
+            if frame_sink is not None:
+                stream.write(b"]")
+            for key, value in payload.items():
+                if not first_member:
+                    stream.write(b",")
+                stream.write(_encode_json(key))
+                stream.write(b":")
+                stream.write(_encode_json(_to_jsonable(value)))
+                first_member = False
+            stream.write(b"}\n")
+
+        temporary_path.replace(output_path)
+        return payload
+    except BaseException:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
 
 
 def analyze_trajectory_batch(
@@ -182,7 +244,7 @@ def analyze_trajectory_batch(
     start: Optional[int] = None,
     stop: Optional[int] = None,
     step: int = 1,
-    batch_size: int = 128,
+    batch_size: int = 256,
     mode: str = "per-frame",
     continuous_strands: bool = False,
     altloc: Optional[str] = None,
@@ -194,12 +256,13 @@ def analyze_trajectory_batch(
     axis_convention: str = "curvesplus",
     curvesplus_axis_steps: bool = False,
     fit_quality: bool = False,
+    axis_weighting: Optional[bool] = None,
 ) -> Dict:
     """Run the vectorized Curves+/standard-frame MD path from Python.
 
     This is the notebook-friendly equivalent of ``pycurves-md-batch``. It is
-    intended for canonical, standard-frame analyses where the experimental
-    batch engine is applicable.
+    intended for canonical, standard-frame analyses supported by the batch
+    engine.
     """
     if mode not in {"per-frame", "summary", "both"}:
         raise ValueError("mode must be one of: per-frame, summary, both")
@@ -225,6 +288,7 @@ def analyze_trajectory_batch(
         axis_convention=axis_convention,
         curvesplus_axis_steps=curvesplus_axis_steps,
         fit_quality=fit_quality,
+        axis_weighting=axis_weighting,
         altloc=altloc,
     )
     try:
@@ -235,7 +299,7 @@ def analyze_trajectory_batch(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Experimental vectorized pyCurves MD runner for standard-frame "
+            "Vectorized pyCurves MD runner for standard-frame "
             "Curves+ axis analyses."
         )
     )
@@ -250,7 +314,7 @@ def main() -> None:
     parser.add_argument("--start", type=int, help="First frame index to include.")
     parser.add_argument("--stop", type=int, help="Stop before this frame index.")
     parser.add_argument("--step", type=int, default=1, help="Frame stride.")
-    parser.add_argument("--batch-size", type=int, default=128, help="Number of selected frames processed per vectorized batch.")
+    parser.add_argument("--batch-size", type=int, default=256, help="Number of selected frames processed per vectorized batch.")
     parser.add_argument("--continuous-strands", action="store_true", help="Treat connected helical components as continuous during .inp inference.")
     parser.add_argument("--altloc", help="Alternate conformation such as A or B; default keeps Gemmi's first-listed conformer.")
     parser.add_argument("--fit", action=argparse.BooleanOptionalAction, default=None, help="Override least-squares base fitting; batch mode currently requires true.")
@@ -259,21 +323,24 @@ def main() -> None:
     parser.add_argument("--grooves", action=argparse.BooleanOptionalAction, default=None, help="Override groove analysis; defaults to the .inp grv setting.")
     parser.add_argument("--frame-convention", default="standard", help="Currently only standard is supported.")
     parser.add_argument("--axis-convention", default="curvesplus", help="Currently only curvesplus is supported.")
+    parser.add_argument(
+        "--axis-weighting",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Weight smooth-axis construction by fitted-pair geometry (default: disabled).",
+    )
     parser.add_argument("--curvesplus-axis-steps", action="store_true", help="Include the Curves+ smooth-axis inter-base-pair step table.")
     parser.add_argument("--fit-quality", action="store_true", help="Include vectorized base-fitting RMSD diagnostics.")
     args = parser.parse_args()
 
     try:
-        payload = run_batch(args)
+        if args.format == "json":
+            payload = _write_streamed_json(args)
+        else:
+            payload = run_batch(args)
+            _write_csv_payload(payload, args.output_file.removesuffix(".csv"))
     except (ValueError, ImportError, NotImplementedError) as exc:
         raise SystemExit(str(exc)) from exc
-
-    if args.format == "json":
-        output_path = Path(args.output_file)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps(_to_jsonable(payload), indent=2, allow_nan=False) + "\n", encoding="utf-8")
-    else:
-        _write_csv_payload(payload, args.output_file.removesuffix(".csv"))
 
     generated = payload["inputs"].get("generated_inpfiles") or []
     if generated:
@@ -285,7 +352,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
-
-

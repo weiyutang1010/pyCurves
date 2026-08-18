@@ -1,2 +1,8 @@
 *.pyc
 __pycache__/
+/curves_source_code
+/transfer_research
+/tests
+/figures
+/test_tmp_4ocb_sign_20260807
+*.inp

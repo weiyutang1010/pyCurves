@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -21,12 +22,19 @@ def _resolve_path(path_text: Optional[str], json_path: Path) -> Optional[Path]:
 
 
 def _structure_format(path: Path) -> str:
-    suffix = path.suffix.lower()
+    suffix = path.with_suffix("").suffix.lower() if path.suffix.lower() == ".gz" else path.suffix.lower()
     if suffix in {".cif", ".mmcif"}:
-        return "mmcif"
+        return "cif"
     if suffix in {".pdb", ".ent"}:
         return "pdb"
     return suffix.lstrip(".") or "pdb"
+
+
+def _read_structure_text(path: Path) -> str:
+    if path.suffix.lower() == ".gz":
+        with gzip.open(path, "rt", encoding="utf-8", errors="ignore") as handle:
+            return handle.read()
+    return path.read_text(encoding="utf-8", errors="ignore")
 
 
 def _load_results(json_path: Path) -> Dict[str, Any]:
@@ -35,7 +43,27 @@ def _load_results(json_path: Path) -> Dict[str, Any]:
 
 
 def render_viewer_html(results: Dict[str, Any], structure_text: str, structure_format: str, title: str) -> str:
-    visualization = results.get("visualization", {})
+    visualization = dict(results.get("visualization", {}))
+    parameters = dict(visualization.get("parameters", {}))
+    for name in (
+        "global_base_axis",
+        "global_base_pair_axis",
+        "curvesplus_base_pair_axis",
+        "global_base_base",
+        "global_inter_base",
+        "global_inter_base_pair",
+        "global_axis_curvature",
+        "global_axis_bending",
+        "global_axis_bending_summary",
+        "local_base_base",
+        "local_inter_base",
+        "local_inter_base_pair",
+        "backbone",
+    ):
+        rows = results.get("dataframes", {}).get(name)
+        if isinstance(rows, list):
+            parameters[name] = rows
+    visualization["parameters"] = parameters
     inputs = results.get("inputs", {})
     summary = {
         "program": results.get("program", "pyCurves"),
@@ -74,7 +102,7 @@ def write_viewer(json_file: str, output_file: Optional[str] = None, structure_fi
             "Could not find the source PDB/mmCIF file. Pass it explicitly with --structure."
         )
 
-    structure_text = structure_path.read_text(encoding="utf-8", errors="ignore")
+    structure_text = _read_structure_text(structure_path)
     output_path = Path(output_file) if output_file else json_path.with_suffix(".viewer.html")
     html = render_viewer_html(
         results=results,
@@ -125,17 +153,22 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
     .app {
       display: grid;
-      grid-template-columns: 420px minmax(0, 1fr);
+      grid-template-columns: 290px minmax(0, 1fr);
+      grid-template-rows: minmax(260px, 1fr) auto minmax(220px, 32vh);
       height: 100vh;
     }
     aside {
+      grid-row: 1 / -1;
       border-right: 1px solid var(--line);
       background: var(--panel);
       padding: 18px 16px;
       overflow: auto;
     }
     main {
+      grid-column: 2;
+      grid-row: 1;
       min-width: 0;
+      min-height: 0;
       position: relative;
     }
     h1 {
@@ -205,6 +238,39 @@ HTML_TEMPLATE = r"""<!doctype html>
     button:hover {
       border-color: var(--accent);
     }
+    .view-actions {
+      display: flex;
+      margin: 14px 0;
+    }
+    .view-actions button {
+      width: auto;
+      padding: 0 12px;
+    }
+    .display-options {
+      margin-top: 14px;
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+      padding: 10px 0;
+    }
+    .display-options summary {
+      color: var(--muted);
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .option-grid {
+      display: grid;
+      gap: 2px;
+      padding-top: 8px;
+    }
+    .select-label {
+      display: block;
+      min-height: 0;
+      margin: 7px 0 4px;
+      color: var(--muted);
+      cursor: default;
+      font-size: 12px;
+    }
     #viewer {
       position: absolute;
       inset: 0;
@@ -216,35 +282,207 @@ HTML_TEMPLATE = r"""<!doctype html>
       line-height: 1.4;
     }
     .tabs {
-      display: grid;
-      grid-template-columns: repeat(3, 1fr);
-      gap: 6px;
-      margin-bottom: 8px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+      margin: 0;
     }
     .tabs button {
+      width: auto;
       height: 30px;
       font-size: 12px;
-      padding: 0 6px;
+      padding: 0 10px;
     }
     .tabs button.active {
-      border-color: var(--accent);
-      color: #ffffff;
-      background: var(--accent);
+      border-color: #9fc4e5;
+      color: var(--accent);
+      background: #eaf3fb;
+      font-weight: 700;
+    }
+    .feature-groups {
+      display: flex;
+      min-width: 0;
+      flex: 1;
+      flex-wrap: wrap;
+      gap: 6px 18px;
+    }
+    .feature-group {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 5px 8px;
+    }
+    .feature-group > span {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .sequence-panel {
+      grid-column: 2;
+      grid-row: 2;
+      min-width: 0;
+      padding: 8px 14px 9px;
+      border-top: 1px solid var(--line);
+      background: #ffffff;
+    }
+    .sequence-panel[hidden] {
+      display: none;
+    }
+    .sequence-head {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 5px 14px;
+      margin-bottom: 5px;
+    }
+    .sequence-head h2 {
+      margin: 0;
+    }
+    .sequence-summary {
+      flex: 1;
+      min-width: 220px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .sequence-legend {
+      display: flex;
+      gap: 10px;
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .legend-mark {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      margin-right: 4px;
+      border-radius: 50%;
+    }
+    .legend-mark.critical {
+      background: #c23b22;
+    }
+    .legend-mark.warning {
+      background: #c58a10;
+    }
+    .sequence-scroll {
+      overflow-x: auto;
+      padding: 2px 0 4px;
+      scrollbar-gutter: stable;
+    }
+    .sequence-row {
+      display: flex;
+      width: max-content;
+      min-width: 100%;
+      align-items: flex-end;
+    }
+    .sequence-strand {
+      position: sticky;
+      left: 0;
+      z-index: 2;
+      width: 70px;
+      flex: 0 0 70px;
+      padding: 0 7px 7px 0;
+      color: var(--muted);
+      background: #ffffff;
+      font-size: 10px;
+      text-align: right;
+    }
+    .sequence-base,
+    .sequence-gap {
+      width: 28px;
+      height: 38px;
+      flex: 0 0 28px;
+    }
+    .sequence-base {
+      position: relative;
+      border: 0;
+      border-bottom: 3px solid transparent;
+      border-radius: 4px;
+      padding: 11px 0 0;
+      color: var(--base-color);
+      background: transparent;
+      font-size: 17px;
+      font-weight: 700;
+      line-height: 22px;
+    }
+    .sequence-base::before {
+      content: attr(data-residue);
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      color: #8a93a3;
+      font-size: 9px;
+      font-weight: 400;
+      line-height: 11px;
+    }
+    .sequence-base:hover {
+      background: #f1f5f9;
+    }
+    .sequence-base.critical {
+      border-bottom-color: #c23b22;
+      background: #fff2ee;
+    }
+    .sequence-base.warning {
+      border-bottom-color: #c58a10;
+      background: #fff8e7;
+    }
+    .sequence-base.selected {
+      outline: 2px solid var(--accent);
+      outline-offset: -2px;
+      background: #eaf3fb;
+    }
+    .sequence-controls {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding-left: 70px;
+    }
+    .sequence-controls input {
+      min-width: 160px;
+      flex: 1;
+    }
+    .sequence-controls output {
+      min-width: 58px;
+      color: var(--muted);
+      font-size: 11px;
+      text-align: right;
+    }
+    .parameters-panel {
+      grid-column: 2;
+      grid-row: 3;
+      display: flex;
+      min-width: 0;
+      min-height: 0;
+      flex-direction: column;
+      gap: 8px;
+      padding: 10px 14px 12px;
+      border-top: 1px solid var(--line);
+      background: var(--panel);
+    }
+    .parameters-head {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px 16px;
+    }
+    .parameters-head h2 {
+      margin: 0;
     }
     .table-wrap {
-      max-height: 260px;
+      flex: 1;
+      min-height: 0;
       overflow: auto;
       border: 1px solid var(--line);
       border-radius: 8px;
       background: #ffffff;
       scrollbar-gutter: stable both-edges;
-      padding-right: 18px;
     }
     table {
       min-width: 720px;
+      width: 100%;
       border-collapse: collapse;
       font-size: 12px;
-      margin-right: 18px;
     }
     th,
     td {
@@ -288,19 +526,54 @@ HTML_TEMPLATE = r"""<!doctype html>
       color: #111827;
       font-weight: 700;
     }
+    .annotation-badge {
+      display: inline-block;
+      min-width: 28px;
+      margin-right: 6px;
+      padding: 1px 4px;
+      border-radius: 999px;
+      color: #ffffff;
+      font-size: 9px;
+      font-weight: 700;
+      line-height: 14px;
+      text-align: center;
+      vertical-align: 1px;
+    }
+    .annotation-badge.critical {
+      background: #c23b22;
+    }
+    .annotation-badge.warning {
+      background: #c58a10;
+    }
     .empty {
       padding: 10px;
       color: var(--muted);
       font-size: 13px;
     }
-    @media (max-width: 780px) {
+    @media (max-width: 820px) {
       .app {
         grid-template-columns: 1fr;
-        grid-template-rows: auto minmax(420px, 1fr);
+        grid-template-rows: auto minmax(420px, 55vh) auto minmax(240px, 35vh);
+        height: auto;
+        min-height: 100vh;
       }
       aside {
+        grid-column: 1;
+        grid-row: 1;
         border-right: 0;
         border-bottom: 1px solid var(--line);
+      }
+      main {
+        grid-column: 1;
+        grid-row: 2;
+      }
+      .sequence-panel {
+        grid-column: 1;
+        grid-row: 3;
+      }
+      .parameters-panel {
+        grid-column: 1;
+        grid-row: 4;
       }
     }
   </style>
@@ -310,41 +583,80 @@ HTML_TEMPLATE = r"""<!doctype html>
     <aside>
       <h1 id="title"></h1>
       <div class="meta" id="meta"></div>
-
-      <h2>Display</h2>
-      <label><input type="checkbox" id="showOtherChains" checked> Show chains other than DNA</label>
-      <label><input type="checkbox" id="showCartoon" checked> Cartoon</label>
-      <label><input type="checkbox" id="showAllAtoms"> All atoms</label>
-      <select id="colorMode" aria-label="Color mode">
-        <option value="chain">Color by chain</option>
-        <option value="residue">Color by residue</option>
-        <option value="element">Color by element</option>
-      </select>
-      <label><input type="checkbox" id="showAxis" checked> Smoothed axis</label>
-      <label><input type="checkbox" id="showBackbone" checked> Backbone spline curve</label>
-      <label><input type="checkbox" id="showActualBlocks" checked> Actual base blocks</label>
-      <label><input type="checkbox" id="showAnalyticalBases"> Analytical base frames</label>
-      <label><input type="checkbox" id="showLabels"> Labels</label>
-      <label><input type="checkbox" id="showOnlyUnusual"> Only unusual pairs</label>
-
-      <h2>Parameters</h2>
-      <div class="tabs">
-        <button type="button" class="active" data-tab="base_pair">Base Pair</button>
-        <button type="button" data-tab="base_pair_axis">BP Axis</button>
-        <button type="button" data-tab="global_step">Global Step</button>
-        <button type="button" data-tab="local_step">Local Step</button>
-        <button type="button" data-tab="base_axis">Base Axis</button>
-        <button type="button" data-tab="groove">Groove</button>
+      <div class="view-actions">
+        <button id="resetView" type="button">Reset view</button>
       </div>
-      <div class="table-wrap" id="parameterTable"></div>
-
-      <h2>View</h2>
-      <button id="resetView" type="button">Reset View</button>
+      <details class="display-options">
+        <summary>Display options</summary>
+        <div class="option-grid">
+          <label><input type="checkbox" id="showOtherChains" checked> Show chains other than DNA</label>
+          <label><input type="checkbox" id="showCartoon" checked> Cartoon</label>
+          <label><input type="checkbox" id="showAllAtoms"> All atoms</label>
+          <label class="select-label" for="colorMode">Molecule color</label>
+          <select id="colorMode">
+            <option value="chain">By chain</option>
+            <option value="residue">By residue</option>
+            <option value="element">By element</option>
+          </select>
+          <label><input type="checkbox" id="showAxis" checked> Smoothed axis</label>
+          <label><input type="checkbox" id="showBackbone" checked> Backbone spline curve</label>
+          <label><input type="checkbox" id="showActualBlocks" checked> Actual base blocks</label>
+          <label><input type="checkbox" id="showAnalyticalBases"> Analytical base frames</label>
+          <label><input type="checkbox" id="showLabels"> Labels</label>
+          <label><input type="checkbox" id="showOnlyUnusual"> Only unusual pairs</label>
+        </div>
+      </details>
       <p class="load-error" id="loadError" hidden></p>
     </aside>
     <main>
       <div id="viewer"></div>
     </main>
+    <section class="sequence-panel" aria-labelledby="sequenceTitle">
+      <div class="sequence-head">
+        <h2 id="sequenceTitle">DNA sequence</h2>
+        <div class="sequence-summary" id="sequenceSummary">Choose a base to inspect it in 3D.</div>
+        <div class="sequence-legend" aria-label="Annotation legend">
+          <span><i class="legend-mark critical"></i>Critical</span>
+          <span><i class="legend-mark warning"></i>Review</span>
+        </div>
+      </div>
+      <div class="sequence-scroll" id="sequenceViewer"></div>
+      <div class="sequence-controls">
+        <input id="sequenceSlider" type="range" aria-label="DNA sequence level">
+        <output id="sequenceLevel" for="sequenceSlider"></output>
+      </div>
+    </section>
+    <section class="parameters-panel" aria-labelledby="parametersTitle">
+      <div class="parameters-head">
+        <h2 id="parametersTitle">DNA shape</h2>
+        <div class="feature-groups">
+          <div class="feature-group" data-feature-group="global">
+            <span>Global features</span>
+            <div class="tabs">
+              <button type="button" data-tab="global_base_axis">Base Axis</button>
+              <button type="button" data-tab="global_base_pair_axis">BP Axis</button>
+              <button type="button" data-tab="global_base_pair">Base Pair</button>
+              <button type="button" data-tab="global_strand_step">Strand Step</button>
+              <button type="button" data-tab="global_base_pair_step">BP Step</button>
+              <button type="button" data-tab="global_axis_curvature">Axis Curvature</button>
+              <button type="button" data-tab="global_axis_bending">Axis Bending</button>
+              <button type="button" data-tab="global_axis_bending_summary">Bending Summary</button>
+            </div>
+          </div>
+          <div class="feature-group" data-feature-group="local">
+            <span>Local features</span>
+            <div class="tabs">
+              <button type="button" data-tab="local_base_pair">Base Pair</button>
+              <button type="button" data-tab="local_strand_step">Strand Step</button>
+              <button type="button" data-tab="local_base_pair_step">BP Step</button>
+              <button type="button" data-tab="backbone">Backbone</button>
+              <button type="button" data-tab="groove">Groove</button>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="table-wrap" id="parameterTable"></div>
+    </section>
   </div>
 
   <script>
@@ -367,15 +679,18 @@ HTML_TEMPLATE = r"""<!doctype html>
     let viewer = null;
     let overlayShapes = [];
     let overlayLabels = [];
+    let selectionShapes = [];
+    let selectionLabels = [];
+    let drawingSelection = false;
+    const parameterTabOrder = [
+      "global_base_axis", "global_base_pair_axis", "global_base_pair",
+      "global_strand_step", "global_base_pair_step", "global_axis_curvature",
+      "global_axis_bending", "global_axis_bending_summary", "local_base_pair",
+      "local_strand_step", "local_base_pair_step", "backbone", "groove"
+    ];
+
     function initialParameterTab() {
-      const params = VIS.parameters || {};
-      if ((params.base_pair || []).length) return "base_pair";
-      if ((params.base_pair_axis || []).length) return "base_pair_axis";
-      if ((params.global_step || []).length) return "global_step";
-      if ((params.local_step || []).length) return "local_step";
-      if ((params.base_axis || []).length) return "base_axis";
-      if ((params.groove || []).length) return "groove";
-      return "base_pair";
+      return parameterTabOrder.find(tab => tableRowsForTab(tab).length) || "global_base_pair";
     }
 
     let activeTab = initialParameterTab();
@@ -455,8 +770,24 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
 
     function addShape(shape) {
-      overlayShapes.push(shape);
+      (drawingSelection ? selectionShapes : overlayShapes).push(shape);
       return shape;
+    }
+
+    function addLabel(label) {
+      (drawingSelection ? selectionLabels : overlayLabels).push(label);
+      return label;
+    }
+
+    function addCurve(points, color, radius, opacity = 1.0) {
+      if (!points || points.length < 2) return;
+      addShape(viewer.addCurve({
+        points: points.map(xyz),
+        radius,
+        color,
+        opacity,
+        smooth: 1
+      }));
     }
 
     function addSegment(a, b, color, radius, opacity = 1.0) {
@@ -621,12 +952,14 @@ HTML_TEMPLATE = r"""<!doctype html>
       const edgeOpacity = options.edgeOpacity ?? 0.95;
       const fillColor = options.fillColor || color;
       addFilledQuad(corners, fillColor, fillOpacity);
-      addSegment(corners[0], corners[1], outlineColor, edgeRadius, edgeOpacity);
-      addSegment(corners[1], corners[2], outlineColor, edgeRadius, edgeOpacity);
-      addSegment(corners[2], corners[3], outlineColor, edgeRadius, edgeOpacity);
-      addSegment(corners[3], corners[0], outlineColor, edgeRadius, edgeOpacity);
-      if (partner && options.highlightFacingEdge !== false) {
-        addSegment(corners[3], corners[0], outlineColor, edgeRadius * 1.9, 1.0);
+      if (options.outline !== false) {
+        addSegment(corners[0], corners[1], outlineColor, edgeRadius, edgeOpacity);
+        addSegment(corners[1], corners[2], outlineColor, edgeRadius, edgeOpacity);
+        addSegment(corners[2], corners[3], outlineColor, edgeRadius, edgeOpacity);
+        addSegment(corners[3], corners[0], outlineColor, edgeRadius, edgeOpacity);
+        if (partner && options.highlightFacingEdge !== false) {
+          addSegment(corners[3], corners[0], outlineColor, edgeRadius * 1.9, 1.0);
+        }
       }
     }
 
@@ -827,7 +1160,7 @@ HTML_TEMPLATE = r"""<!doctype html>
 
     function addValueLabel(point, text, color = "#151a24") {
       if (!point || !text) return;
-      overlayLabels.push(viewer.addLabel(text, {
+      addLabel(viewer.addLabel(text, {
         position: xyz(point),
         fontSize: 11,
         fontColor: color,
@@ -839,14 +1172,183 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
 
     function isUnusual(pair) {
-      return pair.is_hoogsteen || pair.is_mismatch || pair.has_modified_base || !pair.shape_parameters_supported || !pair.is_canonical;
+      return Boolean(pairAnnotation(pair));
+    }
+
+    function pairAnnotation(pair) {
+      if (!pair) return null;
+      const observed = String(pair.observed_lw_family || "").trim();
+      const family = String(pair.pair_family || "").trim().toLowerCase();
+      const mode = String(pair.pairing_mode || "").trim().toLowerCase();
+      const status = String(pair.pair_status || "present").trim().toLowerCase();
+      if (pair.has_modified_base) {
+        return {kind: "critical", label: "Modified", detail: "Modified base in pair"};
+      }
+      const namedModes = {
+        reverse_watson_crick: ["Reverse WC", "Reverse Watson-Crick base pair"],
+        hoogsteen: ["Hoogsteen", "Hoogsteen base pair"],
+        reverse_hoogsteen: ["Reverse Hoogsteen", "Reverse Hoogsteen base pair"],
+        wobble: ["Wobble", "Wobble base pair"]
+      };
+      if (namedModes[mode]) {
+        return {kind: "critical", label: namedModes[mode][0], detail: namedModes[mode][1]};
+      }
+      if (mode === "other_noncanonical") {
+        return {kind: "critical", label: observed || "Noncanonical", detail: `Other noncanonical base pair${observed ? ": " + observed : ""}`};
+      }
+      if (pair.is_hoogsteen || family.includes("hoogsteen")) {
+        return {kind: "critical", label: "Hoogsteen", detail: "Hoogsteen base pair"};
+      }
+      if (family === "wobble") {
+        return {kind: "critical", label: "Wobble", detail: "Wobble base pair"};
+      }
+      if (pair.is_mismatch || family === "mismatch") {
+        return {kind: "critical", label: "Mismatch", detail: "Mismatched base pair"};
+      }
+      if ((observed && observed.toLowerCase() !== "cww") || family.includes("noncanonical")) {
+        const label = observed && observed.toLowerCase() !== "cww" ? observed : "Non-WC";
+        return {kind: "critical", label, detail: `Non-canonical contact${observed ? ": " + observed : ""}`};
+      }
+      if (!pair.shape_parameters_supported) {
+        return {kind: "critical", label: "No shape", detail: "Shape parameters are unsupported for this pair"};
+      }
+      if (status !== "present") {
+        return {kind: "warning", label: status || "Review", detail: `Pair status: ${status || "uncertain"}`};
+      }
+      const flags = (pair.diagnostic_flags || []).filter(Boolean);
+      if (flags.length) {
+        return {kind: "warning", label: "Review", detail: flags.map(flag => String(flag).replaceAll("_", " ")).join("; ")};
+      }
+      return null;
+    }
+
+    function highlightSequenceLevel(level) {
+      const numericLevel = Number(level);
+      document.querySelectorAll(".sequence-base.selected").forEach(base => base.classList.remove("selected"));
+      const selectedBases = document.querySelectorAll(`.sequence-base[data-level="${numericLevel}"]`);
+      selectedBases.forEach(base => base.classList.add("selected"));
+      if (selectedBases.length) selectedBases[0].scrollIntoView({block: "nearest", inline: "center"});
+      const slider = document.getElementById("sequenceSlider");
+      slider.value = numericLevel;
+      document.getElementById("sequenceLevel").value = `Level ${numericLevel}`;
+      const pair = pairAtLevel(numericLevel);
+      const annotation = pairAnnotation(pair);
+      const bases = (VIS.base_origins || []).filter(base => Number(base.level) === numericLevel);
+      const labels = bases.map(base => `${base.chain_id || "S" + base.strand}:${base.parent_base || base.residue_name}${base.residue_id}`).join(" / ");
+      document.getElementById("sequenceSummary").textContent = pair
+        ? `Level ${numericLevel} · ${pair.label || labels}${annotation ? " · " + annotation.detail : ""}`
+        : `Level ${numericLevel} · ${labels || "no base"} · no inferred base pair`;
+    }
+
+    function selectSequenceLevel(level, focusViewer = false) {
+      const numericLevel = Number(level);
+      highlightSequenceLevel(numericLevel);
+      const pair = pairAtLevel(numericLevel);
+      activeTab = tableRowsForTab("global_base_pair").length ? "global_base_pair" : "local_base_pair";
+      document.querySelectorAll(".tabs button").forEach(button => {
+        button.classList.toggle("active", button.dataset.tab === activeTab);
+      });
+      const entry = tableRowsForTab(activeTab).find(row => Number(row.level) === numericLevel);
+      selectedInspection = entry
+        ? Object.assign({}, entry, {type: pair ? "base_pair" : "sequence", feature: null, featureLabel: null, featureValue: null})
+        : {id: `sequence:${numericLevel}`, type: "sequence", level: numericLevel};
+      renderParameterTable();
+      redrawSelection();
+      const tableRow = document.querySelector("#parameterTable tbody tr.selected");
+      if (tableRow) tableRow.scrollIntoView({block: "nearest"});
+      if (focusViewer && viewer) {
+        const bases = pair
+          ? [pair.first, pair.second]
+          : (VIS.base_origins || []).filter(base => Number(base.level) === numericLevel);
+        const selections = bases.filter(Boolean).map(base => {
+          const selection = {resi: Number(base.residue_id)};
+          if (base.chain_id) selection.chain = base.chain_id;
+          return selection;
+        });
+        if (selections.length) {
+          viewer.center({or: selections}, 250);
+          viewer.render();
+        }
+      }
+    }
+
+    function renderSequenceNavigator() {
+      const bases = VIS.base_origins || [];
+      const panel = document.querySelector(".sequence-panel");
+      if (!bases.length) {
+        panel.hidden = true;
+        return;
+      }
+      const groups = new Map();
+      bases.forEach(base => {
+        const strand = Number(base.strand || 0);
+        if (!groups.has(strand)) groups.set(strand, new Map());
+        groups.get(strand).set(Number(base.level), base);
+      });
+      const levels = bases.map(base => Number(base.level));
+      const minLevel = Math.min(...levels);
+      const maxLevel = Math.max(...levels);
+      const pairByLevel = new Map((VIS.base_pairs || []).map(pair => [Number(pair.level), pair]));
+      const container = document.getElementById("sequenceViewer");
+      container.replaceChildren();
+      Array.from(groups.entries()).sort((left, right) => left[0] - right[0]).forEach(([strand, basesByLevel], index) => {
+        const row = document.createElement("div");
+        row.className = "sequence-row";
+        const strandLabel = document.createElement("span");
+        strandLabel.className = "sequence-strand";
+        strandLabel.textContent = `S${strand} ${index === 0 ? "5′→3′" : "3′→5′"}`;
+        row.appendChild(strandLabel);
+        for (let level = minLevel; level <= maxLevel; level += 1) {
+          const base = basesByLevel.get(level);
+          if (!base) {
+            const gap = document.createElement("span");
+            gap.className = "sequence-gap";
+            row.appendChild(gap);
+            continue;
+          }
+          const button = document.createElement("button");
+          const pair = pairByLevel.get(level);
+          const annotation = pair ? pairAnnotation(pair) : (groups.size > 1 ? {kind: "warning", detail: "No inferred base pair"} : null);
+          const letter = String(base.parent_base || base.residue_name || "?").replace(/^D/i, "").slice(0, 1).toUpperCase();
+          button.type = "button";
+          button.className = `sequence-base${annotation ? " " + annotation.kind : ""}`;
+          button.dataset.level = level;
+          button.dataset.residue = base.residue_id;
+          button.style.setProperty("--base-color", baseColor(letter));
+          button.textContent = letter;
+          button.title = `${base.chain_id || "Strand " + strand}:${base.residue_name}${base.residue_id} · level ${level}${annotation ? " · " + annotation.detail : ""}`;
+          button.setAttribute("aria-label", button.title);
+          button.addEventListener("click", () => selectSequenceLevel(level, true));
+          row.appendChild(button);
+        }
+        container.appendChild(row);
+      });
+      const slider = document.getElementById("sequenceSlider");
+      slider.min = minLevel;
+      slider.max = maxLevel;
+      slider.step = 1;
+      slider.value = minLevel;
+      slider.addEventListener("input", event => highlightSequenceLevel(event.target.value));
+      slider.addEventListener("change", event => selectSequenceLevel(event.target.value, true));
+      highlightSequenceLevel(minLevel);
     }
 
     function clearOverlays() {
       overlayShapes.forEach(shape => viewer.removeShape(shape));
       overlayLabels.forEach(label => viewer.removeLabel(label));
+      selectionShapes.forEach(shape => viewer.removeShape(shape));
+      selectionLabels.forEach(label => viewer.removeLabel(label));
       overlayShapes = [];
       overlayLabels = [];
+      selectionShapes = [];
+      selectionLabels = [];
+    }
+
+    function clearSelection() {
+      selectionShapes.forEach(shape => viewer.removeShape(shape));
+      selectionLabels.forEach(label => viewer.removeLabel(label));
+      selectionShapes = [];
+      selectionLabels = [];
     }
 
     function drawStructure() {
@@ -920,11 +1422,9 @@ HTML_TEMPLATE = r"""<!doctype html>
           ? strandColors[index % strandColors.length]
           : "#00a7c7";
         group.sort((a, b) => Number(a.level) - Number(b.level));
-        for (let i = 1; i < group.length; i += 1) {
-          addSegment(group[i - 1], group[i], "#07111f", 0.34, 0.28);
-          addSegment(group[i - 1], group[i], color, 0.23, 1.0);
-        }
-        group.forEach(point => addPoint(point, color, 0.34));
+        if (group.length === 1) addPoint(group[0], color, 0.34);
+        addCurve(group, "#07111f", 0.34, 0.28);
+        addCurve(group, color, 0.23, 1.0);
       });
     }
 
@@ -933,23 +1433,24 @@ HTML_TEMPLATE = r"""<!doctype html>
         const color = strandColors[index % strandColors.length];
         const points = (backbone.spline_points && backbone.spline_points.length > 1) ? backbone.spline_points : (backbone.points || []);
         const usingSpline = backbone.spline_points && backbone.spline_points.length > 1;
-        for (let i = 1; i < points.length; i += 1) {
-          addSegment(points[i - 1], points[i], "#101820", usingSpline ? 0.24 : 0.32, 0.42);
-          addSegment(points[i - 1], points[i], color, usingSpline ? 0.15 : 0.22, 1.0);
-        }
-        if (usingSpline) {
-          (backbone.points || []).forEach(point => addPoint(point, color, 0.16));
-        } else {
-          points.forEach(point => addPoint(point, color, 0.28));
-        }
+        if (points.length === 1) addPoint(points[0], color, usingSpline ? 0.16 : 0.28);
+        addCurve(points, "#101820", usingSpline ? 0.24 : 0.32, 0.42);
+        addCurve(points, color, usingSpline ? 0.15 : 0.22, 1.0);
       });
     }
 
     function tableRowsForTab(tab) {
       const params = VIS.parameters || {};
-      if (tab === "base_pair") {
-        return (params.base_pair || []).map(row => ({
-          id: `base_pair:${row.partner_strand || 0}:${row.level}`,
+      const rowsFor = (name, fallback = null) => {
+        if (Object.prototype.hasOwnProperty.call(params, name)) return params[name] || [];
+        return fallback ? (params[fallback] || []) : [];
+      };
+      if (tab === "global_base_pair" || tab === "local_base_pair") {
+        const source = tab === "global_base_pair"
+          ? rowsFor("global_base_base", "base_pair")
+          : rowsFor("local_base_base", "local_base_pair");
+        return source.map(row => ({
+          id: `${tab}:${row.partner_strand || 0}:${row.level}`,
           type: "base_pair",
           level: Number(row.level),
           partnerStrand: row.partner_strand === undefined || row.partner_strand === null ? null : Number(row.partner_strand),
@@ -967,9 +1468,12 @@ HTML_TEMPLATE = r"""<!doctype html>
           row
         }));
       }
-      if (tab === "base_pair_axis") {
-        return (params.base_pair_axis || []).map(row => ({
-          id: `base_pair_axis:${row.partner_strand || 0}:${row.level}`,
+      if (tab === "global_base_pair_axis") {
+        const source = rowsFor("global_base_pair_axis").length
+          ? rowsFor("global_base_pair_axis")
+          : (rowsFor("curvesplus_base_pair_axis").length ? rowsFor("curvesplus_base_pair_axis") : rowsFor("base_pair_axis"));
+        return source.map(row => ({
+          id: `${tab}:${row.partner_strand || 0}:${row.level}`,
           type: "base_pair_axis",
           level: Number(row.level),
           partnerStrand: row.partner_strand === undefined || row.partner_strand === null ? null : Number(row.partner_strand),
@@ -985,9 +1489,9 @@ HTML_TEMPLATE = r"""<!doctype html>
           row
         }));
       }
-      if (tab === "base_axis") {
-        return (params.base_axis || []).map(row => ({
-          id: `base_axis:${row.strand || 0}:${row.level}`,
+      if (tab === "global_base_axis") {
+        return rowsFor("global_base_axis", "base_axis").map(row => ({
+          id: `${tab}:${row.strand || 0}:${row.level}`,
           type: "base_axis",
           level: Number(row.level),
           strand: row.strand === undefined || row.strand === null ? null : Number(row.strand),
@@ -1004,8 +1508,15 @@ HTML_TEMPLATE = r"""<!doctype html>
           row
         }));
       }
-      if (tab === "global_step" || tab === "local_step") {
-        const source = tab === "global_step" ? (params.global_step || []) : (params.local_step || []);
+      if (["global_strand_step", "global_base_pair_step", "local_strand_step", "local_base_pair_step"].includes(tab)) {
+        const sources = {
+          global_strand_step: ["global_inter_base", "global_strand_step"],
+          global_base_pair_step: ["global_inter_base_pair", "global_step"],
+          local_strand_step: ["local_inter_base", "local_strand_step"],
+          local_base_pair_step: ["local_inter_base_pair", "local_step"]
+        };
+        const [name, fallback] = sources[tab];
+        const source = rowsFor(name, fallback);
         return source.map(row => ({
           id: `${tab}:${row.strand || row.partner_strand || 0}:${row.level}`,
           type: "step",
@@ -1024,6 +1535,96 @@ HTML_TEMPLATE = r"""<!doctype html>
             fmt(row.tilt),
             fmt(row.roll),
             fmt(row.twist),
+          ],
+          row
+        }));
+      }
+      if (tab === "global_axis_curvature") {
+        return rowsFor(tab).map(row => ({
+          id: `${tab}:${row.strand || 0}:${row.level}`,
+          type: "data",
+          level: Number(row.level),
+          strand: row.strand === undefined || row.strand === null ? null : Number(row.strand),
+          features: [null, null, null, null, "ax", "ay", "ainc", "atip", "adis", "angle", "path", null],
+          cells: [
+            row.level,
+            row.next_level,
+            row.strand,
+            row.step || "",
+            fmt(row.ax),
+            fmt(row.ay),
+            fmt(row.ainc),
+            fmt(row.atip),
+            fmt(row.adis),
+            fmt(row.angle),
+            fmt(row.path),
+            fmt(row.dc),
+          ],
+          row
+        }));
+      }
+      if (tab === "global_axis_bending") {
+        return rowsFor(tab).map(row => ({
+          id: `${tab}:${row.strand || 0}:${row.level}`,
+          type: "data",
+          level: Number(row.level),
+          strand: row.strand === undefined || row.strand === null ? null : Number(row.strand),
+          features: [null, null, null, "offset", "local_direction"],
+          cells: [
+            row.level,
+            row.strand,
+            `${row.residue_name || ""} ${row.residue_id || ""}`.trim(),
+            fmt(row.offset),
+            fmt(row.local_direction),
+          ],
+          row
+        }));
+      }
+      if (tab === "global_axis_bending_summary") {
+        return rowsFor(tab).map(row => ({
+          id: `${tab}:${row.strand || 0}`,
+          type: "data",
+          level: null,
+          strand: row.strand === undefined || row.strand === null ? null : Number(row.strand),
+          features: [null, "path_length", "end_to_end", "shortening_percent", "overall_bend_uu", "overall_bend_pp"],
+          cells: [
+            row.strand,
+            fmt(row.path_length),
+            fmt(row.end_to_end),
+            fmt(row.shortening_percent),
+            fmt(row.overall_bend_uu),
+            fmt(row.overall_bend_pp),
+          ],
+          row
+        }));
+      }
+      if (tab === "backbone") {
+        return rowsFor(tab).map(row => ({
+          id: `${tab}:${row.strand || 0}:${row.level}`,
+          type: "data",
+          level: Number(row.level),
+          strand: row.strand === undefined || row.strand === null ? null : Number(row.strand),
+          features: [null, null, null, null, null, "c1_c2", "c2_c3", "phase", "amplitude", "c1_prime", "c2_prime", "c3_prime", "chi", "gamma", "delta", "epsilon", "zeta", "alpha", "beta"],
+          cells: [
+            row.level,
+            row.strand,
+            `${row.residue_name || ""} ${row.residue_id || ""}`.trim(),
+            row.status || "",
+            row.pucker || "",
+            fmt(row.c1_c2),
+            fmt(row.c2_c3),
+            fmt(row.phase),
+            fmt(row.amplitude),
+            fmt(row.c1_prime),
+            fmt(row.c2_prime),
+            fmt(row.c3_prime),
+            fmt(row.chi),
+            fmt(row.gamma),
+            fmt(row.delta),
+            fmt(row.epsilon),
+            fmt(row.zeta),
+            fmt(row.alpha),
+            fmt(row.beta),
           ],
           row
         }));
@@ -1050,11 +1651,14 @@ HTML_TEMPLATE = r"""<!doctype html>
     }
 
     function headersForTab(tab) {
-      if (tab === "base_pair") return ["Level", "Pair", "Shear", "Stretch", "Stagger", "Buckle", "Propel", "Open"];
-      if (tab === "base_pair_axis") return ["Level", "Pair", "Xdisp", "Ydisp", "Inclin", "Tip"];
-      if (tab === "base_axis") return ["Level", "Strand", "Residue", "Xdisp", "Ydisp", "Inclin", "Tip"];
-      if (tab === "global_step") return ["Step", "Residues", "Shift", "Slide", "Rise", "Tilt", "Roll", "Twist"];
-      if (tab === "local_step") return ["Step", "Residues", "Shift", "Slide", "Rise", "Tilt", "Roll", "Twist"];
+      if (tab === "global_base_pair" || tab === "local_base_pair") return ["Level", "Pair", "Shear", "Stretch", "Stagger", "Buckle", "Propel", "Open"];
+      if (tab === "global_base_pair_axis") return ["Level", "Pair", "Xdisp", "Ydisp", "Inclin", "Tip"];
+      if (tab === "global_base_axis") return ["Level", "Strand", "Residue", "Xdisp", "Ydisp", "Inclin", "Tip"];
+      if (["global_strand_step", "global_base_pair_step", "local_strand_step", "local_base_pair_step"].includes(tab)) return ["Step", "Residues", "Shift", "Slide", "Rise", "Tilt", "Roll", "Twist"];
+      if (tab === "global_axis_curvature") return ["Level", "Next", "Strand", "Step", "Ax", "Ay", "Ainc", "Atip", "Adis", "Angle", "Path", "DC"];
+      if (tab === "global_axis_bending") return ["Level", "Strand", "Residue", "Offset", "Local Direction"];
+      if (tab === "global_axis_bending_summary") return ["Strand", "Path Length", "End-to-End", "Shortening %", "Bend UU", "Bend PP"];
+      if (tab === "backbone") return ["Level", "Strand", "Residue", "Status", "Pucker", "C1-C2", "C2-C3", "Phase", "Amplitude", "C1'", "C2'", "C3'", "Chi", "Gamma", "Delta", "Epsilon", "Zeta", "Alpha", "Beta"];
       return ["Level", "Pair", "Minor W", "Minor D", "Minor A", "Major W", "Major D", "Major A", "Diam"];
     }
 
@@ -1066,34 +1670,49 @@ HTML_TEMPLATE = r"""<!doctype html>
         return;
       }
       const headers = headersForTab(activeTab);
+      const annotations = rows.map(entry => {
+        if (!["global_base_pair", "local_base_pair"].includes(activeTab)) return null;
+        const pair = pairAtLevel(entry.level, entry.partnerStrand);
+        return pairAnnotation(pair) || (!pair && baseAtLevel(1, entry.level)
+          ? {kind: "warning", label: "Unpaired", detail: "No inferred base pair"}
+          : null);
+      });
       container.innerHTML = `
         <table>
           <thead><tr>${headers.map(header => `<th>${header}</th>`).join("")}</tr></thead>
           <tbody>
-            ${rows.map((entry, index) => `
-              <tr data-index="${index}" class="${selectedInspection && selectedInspection.id === entry.id ? "selected" : ""}">
+            ${rows.map((entry, index) => {
+              const annotation = annotations[index];
+              return `
+              <tr data-index="${index}" class="${selectedInspection && selectedInspection.id === entry.id ? "selected" : ""}${annotation ? " annotation-" + annotation.kind : ""}">
                 ${entry.cells.map((cell, cellIndex) => {
                   const feature = (entry.features || [])[cellIndex] || "";
                   const selected = feature && selectedInspection && selectedInspection.id === entry.id && selectedInspection.feature === feature;
-                  return `<td data-feature="${feature}" class="${selected ? "selected-feature" : ""}">${cell}</td>`;
+                  const badge = cellIndex === 0 && annotation ? `<span class="annotation-badge ${annotation.kind}">${annotation.label}</span>` : "";
+                  return `<td data-feature="${feature}" class="${selected ? "selected-feature" : ""}">${badge}${cell}</td>`;
                 }).join("")}
               </tr>
-            `).join("")}
+            `;
+            }).join("")}
           </tbody>
         </table>
       `;
       container.querySelectorAll("tbody tr").forEach(row => {
+        const annotation = annotations[Number(row.dataset.index)];
+        if (annotation) row.title = annotation.detail;
         row.addEventListener("click", event => {
           const entry = rows[Number(row.dataset.index)];
           const cell = event.target.closest("td");
           const feature = cell ? (cell.dataset.feature || null) : null;
           selectedInspection = Object.assign({}, entry, {
+            type: ["global_base_pair", "local_base_pair"].includes(activeTab) && !pairAtLevel(entry.level, entry.partnerStrand) ? "sequence" : entry.type,
             feature,
             featureLabel: feature ? featureLabel(feature) : null,
             featureValue: feature ? entry.row[feature] : null
           });
+          if (Number.isFinite(Number(entry.level))) highlightSequenceLevel(entry.level);
           renderParameterTable();
-          redraw();
+          redrawSelection();
         });
       });
     }
@@ -1105,7 +1724,7 @@ HTML_TEMPLATE = r"""<!doctype html>
         button.classList.toggle("active", button.dataset.tab === tab);
       });
       renderParameterTable();
-      redraw();
+      redrawSelection();
     }
 
     function drawActualBlocks() {
@@ -1116,11 +1735,11 @@ HTML_TEMPLATE = r"""<!doctype html>
         const color = pairColor(pair);
         const first = actualBlockForPair(pair.first, pair);
         const second = actualBlockForPair(pair.second, pair);
-        drawBasePlate(first, second, color);
-        drawBasePlate(second, first, color);
+        drawBasePlate(first, second, color, {outline: false});
+        drawBasePlate(second, first, color, {outline: false});
         addSegment(pair.first, pair.second, color, pair.is_canonical ? 0.05 : 0.08, pair.is_canonical ? 0.35 : 0.7);
         if (showLabels && pair.midpoint) {
-          overlayLabels.push(viewer.addLabel(pair.label || `Level ${pair.level}`, {
+          addLabel(viewer.addLabel(pair.label || `Level ${pair.level}`, {
             position: xyz(pair.midpoint),
             fontSize: 10,
             fontColor: "#162033",
@@ -1160,6 +1779,12 @@ HTML_TEMPLATE = r"""<!doctype html>
       drawFrameGlyph(frame, 1.65, "#111827");
       if (entry.feature && drawFeatureMeasurement(frame, entry.feature, entry.featureValue, color)) return;
       addValueLabel(pair.frame_midpoint || pair.midpoint, `Pair frame level ${entry.level}`, color);
+    }
+
+    function drawSelectedSequence(entry) {
+      const bases = (VIS.base_origins || []).filter(base => Number(base.level) === Number(entry.level));
+      bases.forEach(base => drawBasePlate(base, null, "#ff2f00", {fillOpacity: 0.5, edgeRadius: 0.09}));
+      if (bases.length) addValueLabel(bases[0], `Sequence level ${entry.level}`, "#ff2f00");
     }
 
     function drawSelectedBasePairAxis(entry) {
@@ -1281,11 +1906,24 @@ HTML_TEMPLATE = r"""<!doctype html>
 
     function drawInspectionSelection() {
       if (!selectedInspection) return;
+      if (selectedInspection.type === "sequence") drawSelectedSequence(selectedInspection);
       if (selectedInspection.type === "base_pair") drawSelectedBasePair(selectedInspection);
       if (selectedInspection.type === "base_pair_axis") drawSelectedBasePairAxis(selectedInspection);
       if (selectedInspection.type === "base_axis") drawSelectedBaseAxis(selectedInspection);
       if (selectedInspection.type === "step") drawSelectedStep(selectedInspection);
       if (selectedInspection.type === "groove") drawSelectedGroove(selectedInspection);
+    }
+
+    function redrawSelection() {
+      if (!viewer) return;
+      clearSelection();
+      drawingSelection = true;
+      try {
+        drawInspectionSelection();
+      } finally {
+        drawingSelection = false;
+      }
+      viewer.render();
     }
 
     function redraw() {
@@ -1296,7 +1934,12 @@ HTML_TEMPLATE = r"""<!doctype html>
       if (document.getElementById("showBackbone").checked) drawBackbones();
       if (document.getElementById("showActualBlocks").checked) drawActualBlocks();
       if (document.getElementById("showAnalyticalBases").checked) drawAnalyticalBaseFrames();
-      drawInspectionSelection();
+      drawingSelection = true;
+      try {
+        drawInspectionSelection();
+      } finally {
+        drawingSelection = false;
+      }
       viewer.render();
     }
 
@@ -1318,8 +1961,12 @@ HTML_TEMPLATE = r"""<!doctype html>
       input.addEventListener("change", redraw);
     });
     document.querySelectorAll(".tabs button").forEach(button => {
+      button.hidden = !tableRowsForTab(button.dataset.tab).length;
       button.classList.toggle("active", button.dataset.tab === activeTab);
       button.addEventListener("click", () => setActiveTab(button.dataset.tab));
+    });
+    document.querySelectorAll(".feature-group").forEach(group => {
+      group.hidden = !Array.from(group.querySelectorAll("button")).some(button => !button.hidden);
     });
     document.getElementById("colorMode").addEventListener("change", redraw);
     document.getElementById("resetView").addEventListener("click", () => {
@@ -1327,6 +1974,10 @@ HTML_TEMPLATE = r"""<!doctype html>
       viewer.zoomTo();
       viewer.render();
     });
+    window.addEventListener("resize", () => {
+      if (viewer) viewer.resize();
+    });
+    renderSequenceNavigator();
     renderParameterTable();
     window.addEventListener("load", initialize);
   </script>

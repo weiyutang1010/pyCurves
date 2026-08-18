@@ -349,7 +349,7 @@ class VisualizationPayloadMixin:
             backbones.append(backbone_record)
 
         base_pairs = []
-        for pair in annotations.get("base_pair_annotations", []):
+        for pair in self._base_pair_rows(annotations):
             level = int(pair.get("level", 0) or 0)
             strand_1 = int(pair.get("strand_1", 1) or 1)
             strand_2 = int(pair.get("strand_2", 2) or 2)
@@ -378,17 +378,20 @@ class VisualizationPayloadMixin:
                 "frame_midpoint": point_payload(frame_midpoint),
                 "pair_family": pair.get("pair_family", ""),
                 "pair_subtype": pair.get("pair_subtype", ""),
+                "pairing_mode": pair.get("pairing_mode", ""),
+                "pair_status": pair.get("pair_status", "uncertain"),
+                "observed_lw_family": pair.get("observed_lw_family", ""),
+                "reference_lw_family": pair.get("reference_lw_family", ""),
+                "candidate_mode": pair.get("candidate_mode", ""),
+                "classification_status": pair.get("classification_status", "unassigned"),
+                "diagnostic_flags": list(pair.get("diagnostic_flags") or []),
+                "evidence_source": pair.get("evidence_source", ""),
+                "reference_pair": bool(pair.get("reference_pair", True)),
                 "edge_pair": pair.get("edge_pair", ""),
                 "glycosidic_orientation": pair.get("glycosidic_orientation", ""),
-                "glycosidic_conformation_1": pair.get("glycosidic_conformation_1", ""),
-                "glycosidic_conformation_2": pair.get("glycosidic_conformation_2", ""),
-                "lw_default_strand_orientation": pair.get("lw_default_strand_orientation", ""),
                 "lw_strand_orientation": pair.get("lw_strand_orientation", ""),
-                "syn_orientation_reversal": bool(pair.get("syn_orientation_reversal", False)),
-                "effective_local_orientation": pair.get("effective_local_orientation", ""),
                 "strand_direction": pair.get("strand_direction", ""),
                 "topology_strand_direction": pair.get("topology_strand_direction", ""),
-                "partner_frame_transform": pair.get("partner_frame_transform", ""),
                 "frame_mode": pair.get("frame_mode", ""),
                 "is_canonical": bool(pair.get("is_canonical", False)),
                 "is_hoogsteen": bool(pair.get("is_hoogsteen", False)),

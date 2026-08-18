@@ -38,9 +38,7 @@ class ConfigLoader:
         (
             expanded_maps,
             current_idx,
-            hoogsteen_markers,
             pair_geometry_markers,
-            glycosidic_conformation_markers,
         ) = ConfigLoader._parse_strand_maps(
             data_lines,
             strand_count,
@@ -86,9 +84,7 @@ class ConfigLoader:
             "nr": active_end_levels,
             "li_map": initial_level_status,
             "ni_map": subunit_map,
-            "hoogsteen_markers": hoogsteen_markers,
             "pair_geometry_markers": pair_geometry_markers,
-            "glycosidic_conformation_markers": glycosidic_conformation_markers,
             "config": cfg,
         }
 
@@ -208,23 +204,20 @@ class ConfigLoader:
         seen_kinds = set()
         for tag in raw_tags:
             normalized = tag.strip().lower().replace("_", "").replace("-", "")
-            if normalized in {"h", "hoog", "hoogsteen"}:
-                tag_info = {"kind": "hoogsteen", "tag": "Hoog"}
-            elif normalized in {"syn", "anti"}:
-                tag_info = {
-                    "kind": "glycosidic_conformation",
-                    "glycosidic_conformation": normalized,
-                    "tag": normalized,
-                }
-            else:
-                tag_info = ConfigLoader._parse_lw_geometry_tag(normalized)
+            # Older pyCurves builds emitted glycosidic-conformation annotations.
+            # They never affect shape calculations, so accept them as no-ops to
+            # keep existing user-authored .inp files readable.
+            if normalized in {"syn", "anti"}:
+                continue
+            tag_info = ConfigLoader._parse_lw_geometry_tag(normalized)
             if tag_info is None:
                 raise ValueError(
                     f"Unknown Curves topology tag [{tag}] in token {token!r}; "
-                    "supported tags are [syn], [anti], [Hoog], and Leontis-Westhof-style "
-                    "geometry tags like [cWW], [tWH], and [cSS]."
+                    "supported pair-geometry tags use Leontis-Westhof notation "
+                    "or [unresolved], for example [cWW], [tWH], [cSS], and "
+                    "[unresolved]."
                 )
-            kind_group = "pair_geometry" if tag_info["kind"] in {"lw", "hoogsteen"} else tag_info["kind"]
+            kind_group = "pair_geometry"
             if kind_group in seen_kinds:
                 raise ValueError(f"Duplicate {kind_group.replace('_', ' ')} tag in token {token!r}.")
             seen_kinds.add(kind_group)
@@ -233,6 +226,13 @@ class ConfigLoader:
 
     @staticmethod
     def _parse_lw_geometry_tag(normalized: str):
+        if normalized == "unresolved":
+            return {
+                "kind": "unresolved",
+                "tag": "unresolved",
+                "resolution_status": "unresolved",
+                "strand_direction_source": "coordinate_provisional",
+            }
         parts = normalized.split(":", 1)
         lw_text = parts[0]
         direction_text = parts[1] if len(parts) == 2 else ""
@@ -285,9 +285,7 @@ class ConfigLoader:
     def _parse_strand_maps(data_lines, strand_count, signed_strand_lengths, file_path):
         """Support both explicit unit maps and Curves shorthand ranges like 1:12."""
         maps = []
-        hoogsteen_markers = set()
         pair_geometry_markers = {}
-        glycosidic_conformation_markers = {}
         current_idx = 1
         range_style = any(":" in line for line in data_lines[1:1 + strand_count])
 
@@ -305,18 +303,14 @@ class ConfigLoader:
                             strand + 1,
                             len(mapping),
                             mapped_unit,
-                            hoogsteen_markers,
                             pair_geometry_markers,
-                            glycosidic_conformation_markers,
                         )
                 maps.append(mapping)
                 current_idx += 1
             return (
                 maps,
                 current_idx,
-                hoogsteen_markers,
                 pair_geometry_markers,
-                glycosidic_conformation_markers,
             )
 
         level_count = max(abs(value) for value in signed_strand_lengths)
@@ -336,18 +330,14 @@ class ConfigLoader:
                             strand + 1,
                             len(mapping),
                             mapped_unit,
-                            hoogsteen_markers,
                             pair_geometry_markers,
-                            glycosidic_conformation_markers,
                         )
                 current_idx += 1
             maps.append(mapping[:level_count])
         return (
             maps,
             current_idx,
-            hoogsteen_markers,
             pair_geometry_markers,
-            glycosidic_conformation_markers,
         )
 
     @staticmethod
@@ -356,26 +346,17 @@ class ConfigLoader:
         strand: int,
         level: int,
         mapped_unit: int,
-        hoogsteen_markers: set,
         pair_geometry_markers: dict,
-        glycosidic_conformation_markers: dict,
     ) -> None:
         if not tag_infos or mapped_unit == 0:
             return
         for tag_info in tag_infos:
-            if tag_info.get("kind") == "hoogsteen":
-                hoogsteen_markers.add((strand, level))
-                continue
-            if tag_info.get("kind") == "lw":
+            if tag_info.get("kind") in {"lw", "unresolved"}:
                 marker = dict(tag_info)
                 marker["annotated_strand"] = strand
                 marker["level"] = level
                 pair_geometry_markers[(strand, level)] = marker
                 continue
-            if tag_info.get("kind") == "glycosidic_conformation":
-                glycosidic_conformation_markers[(strand, level)] = tag_info[
-                    "glycosidic_conformation"
-                ]
 
     @staticmethod
     def _initialize_helical_input_defaults(

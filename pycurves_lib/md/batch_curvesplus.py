@@ -8,6 +8,8 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from pycurves_lib.core.curves_analyzer import BackboneAnalyzer
+from pycurves_lib.core.parameter_conventions import apply_curvesplus_base_pair_inversion
+from pycurves_lib.core.axis_support import axis_support_weights
 from pycurves_lib.core.curves_dataclasses import (
     BaseGeometryConstants,
     BaseLocator,
@@ -36,21 +38,14 @@ from pycurves_lib.md.trajectory_statistics import (
 STEP_PARAMETERS = ("shift", "slide", "rise", "tilt", "roll", "twist")
 BASE_BASE_PARAMETERS = ("shear", "stretch", "stagger", "buckle", "propel", "opening")
 AXIS_PARAMETERS = ("xdisp", "ydisp", "inclin", "tip")
+BACKBONE_PARAMETERS = (
+    "c1_c2", "c2_c3", "phase", "amplitude", "c1_prime", "c2_prime",
+    "c3_prime", "chi", "gamma", "delta", "epsilon", "zeta", "alpha", "beta",
+)
 SUGAR_PUCKERS = (
     "C3'-endo", "C4'-exo", "O1'-endo", "C1'-exo", "C2'-endo",
     "C3'-exo", "C4'-endo", "O1'-exo", "C1'-endo", "C2'-exo",
 )
-
-SIGN_FLIPS = np.asarray(
-    [
-        np.diag([1.0, 1.0, 1.0]),
-        np.diag([1.0, -1.0, -1.0]),
-        np.diag([-1.0, 1.0, -1.0]),
-        np.diag([-1.0, -1.0, 1.0]),
-    ],
-    dtype=float,
-)
-
 
 @dataclass(frozen=True)
 class BaseFitTemplate:
@@ -248,93 +243,33 @@ def _rigid_body_values_and_middle_frame_batch(
     return values, middle_axes, (first_origin + second_origin) / 2.0
 
 
-def _step_aligned_values_batch(
-    previous_axes: np.ndarray,
-    previous_origin: np.ndarray,
-    current_axes: np.ndarray,
-    current_origin: np.ndarray,
-    degrees_per_radian: float,
-) -> np.ndarray:
-    batch = previous_axes.shape[0]
-    best_score = np.full(batch, -np.inf, dtype=float)
-    best_forward = np.zeros(batch, dtype=bool)
-    best_prev_x = np.full(batch, -np.inf, dtype=float)
-    best_curr_x = np.full(batch, -np.inf, dtype=float)
-    best_rise = np.full(batch, -np.inf, dtype=float)
-    best_values = np.full((batch, 6), np.nan, dtype=float)
-
-    previous_candidates = np.einsum("fij,bjk->fbik", SIGN_FLIPS, previous_axes)
-    current_candidates = np.einsum("fij,bjk->fbik", SIGN_FLIPS, current_axes)
-    p_axes = np.repeat(previous_candidates, len(SIGN_FLIPS), axis=0)
-    c_axes = np.tile(current_candidates, (len(SIGN_FLIPS), 1, 1, 1))
-
-    candidate_scores = np.einsum("cbij,cbij->cb", p_axes, c_axes)
-    max_score = np.max(candidate_scores, axis=0)
-    candidate_prev_x = np.einsum("cbi,bi->cb", p_axes[:, :, 0, :], previous_axes[:, 0, :])
-    candidate_curr_x = np.einsum("cbi,bi->cb", c_axes[:, :, 0, :], current_axes[:, 0, :])
-
-    for candidate_index in range(p_axes.shape[0]):
-        score = candidate_scores[candidate_index]
-        score_tied = np.abs(score - max_score) <= 1e-8
-        if not np.any(score_tied):
-            continue
-
-        values = _rigid_body_values_batch(
-            p_axes[candidate_index, score_tied],
-            previous_origin[score_tied],
-            c_axes[candidate_index, score_tied],
-            current_origin[score_tied],
-            degrees_per_radian,
-            translation_sign=1.0,
-            rotation_sign=1.0,
-        )
-        forward = values[:, 2] >= -1e-8
-        prev_x = candidate_prev_x[candidate_index, score_tied]
-        curr_x = candidate_curr_x[candidate_index, score_tied]
-        rise = values[:, 2]
-
-        subset = np.flatnonzero(score_tied)
-        better = score[score_tied] > best_score[subset] + 1e-8
-        tied = np.abs(score[score_tied] - best_score[subset]) <= 1e-8
-        better |= tied & (forward & ~best_forward[subset])
-        tied_forward = tied & (forward == best_forward[subset])
-        better |= tied_forward & (prev_x > best_prev_x[subset] + 1e-8)
-        tied_prev = tied_forward & (np.abs(prev_x - best_prev_x[subset]) <= 1e-8)
-        better |= tied_prev & (curr_x > best_curr_x[subset] + 1e-8)
-        tied_curr = tied_prev & (np.abs(curr_x - best_curr_x[subset]) <= 1e-8)
-        better |= tied_curr & (rise > best_rise[subset])
-
-        target = subset[better]
-        best_score[target] = score[target]
-        best_forward[target] = forward[better]
-        best_prev_x[target] = prev_x[better]
-        best_curr_x[target] = curr_x[better]
-        best_rise[target] = rise[better]
-        best_values[target] = values[better]
-
-    best_values[:, 3:] = _wrap_180(best_values[:, 3:])
-    return best_values
-
-
 def _parameter_row(values: Optional[Sequence[float]], names: Sequence[str], **metadata) -> Dict:
     row = dict(metadata)
     if values is None:
-        for name in names:
-            row[name] = None
+        row.update(dict.fromkeys(names))
         return row
     values = np.asarray(values, dtype=float)
-    for name, value in zip(names, values):
-        row[name] = float(value) if np.isfinite(value) else None
+    row.update({
+        name: float(value) if finite else None
+        for name, value, finite in zip(names, values, np.isfinite(values))
+    })
     return row
 
 
-class BatchCurvesPlusMDAnalyzer:
-    """Experimental vectorized MD path for standard-frame Curves+ analyses.
+def _json_array(values: np.ndarray) -> list:
+    """Convert one numerical batch to JSON-safe Python values in one pass."""
+    values = np.asarray(values, dtype=float)
+    result = values.astype(object)
+    result[~np.isfinite(values)] = None
+    return result.tolist()
 
-    This intentionally supports a narrow subset first: combined two-strand
-    duplexes with standard base fitting and Curves+ smooth-axis output.  It is
-    designed as a validation target before these kernels are moved into the
-    regular static-structure path.
+
+class BatchCurvesPlusMDAnalyzer:
+    """Vectorized MD path for standard-frame Curves+ analyses.
+
+    Supports combined two-strand duplexes with standard base fitting and
+    Curves+ smooth-axis output. Unsupported combinations remain available
+    through the general frame-by-frame analyzer.
     """
 
     def __init__(
@@ -350,6 +285,7 @@ class BatchCurvesPlusMDAnalyzer:
         include_grooves: Optional[bool] = None,
         include_curvesplus_axis_steps: bool = False,
         include_fit_quality: bool = False,
+        axis_weighting: Optional[bool] = None,
     ):
         self.topology_file = topology_file
         self.altloc = MolecularLoader.normalize_altloc(altloc)
@@ -376,6 +312,7 @@ class BatchCurvesPlusMDAnalyzer:
                 "comb": True if comb_override is None else comb_override,
                 "ends": False if ends_override is None else ends_override,
                 "grv": include_grooves,
+                "axis_weighting": axis_weighting,
             },
         )
         self.ctx = CurvesContext(self.config_dict)
@@ -402,6 +339,7 @@ class BatchCurvesPlusMDAnalyzer:
             for level in range(1, self.ctx.nux + 1)
             if self._has_level(strand, level)
         }
+        self._row_templates = self._build_row_templates()
 
     @staticmethod
     def _resolve_inp(
@@ -442,13 +380,9 @@ class BatchCurvesPlusMDAnalyzer:
             raise NotImplementedError("pycurves-md-batch currently does not support ends=true.")
         if not cfg.fit:
             raise NotImplementedError("pycurves-md-batch currently requires least-squares base fitting.")
-        if (
-            self.ctx.hoogsteen_markers
-            or self.ctx.pair_geometry_markers
-            or self.ctx.glycosidic_conformation_markers
-        ):
+        if self.ctx.pair_geometry_markers:
             raise NotImplementedError(
-                "pycurves-md-batch does not yet support explicit pair-geometry or syn markers; "
+                "pycurves-md-batch does not yet support explicit pair-geometry markers; "
                 "use pycurves-md for those inputs."
             )
 
@@ -603,12 +537,273 @@ class BatchCurvesPlusMDAnalyzer:
                 return int(residue_atoms[alias])
         return None
 
+    def _build_row_templates(self) -> Dict[str, List[Dict]]:
+        """Build frame-independent row metadata once for the trajectory."""
+        levels = self.ctx.nux + 1
+        templates = {
+            "local_inter_base": self._local_inter_base_rows(
+                np.full((self.ctx.nst, levels, len(STEP_PARAMETERS)), np.nan)
+            ),
+            "local_base_base": self._local_base_base_rows(
+                np.full((levels, len(BASE_BASE_PARAMETERS)), np.nan)
+            ),
+            "local_inter_base_pair": self._local_inter_base_pair_rows(
+                np.full((levels, len(STEP_PARAMETERS)), np.nan)
+            ),
+            "curvesplus_base_pair_axis": self._curvesplus_base_pair_axis_rows(
+                np.full((levels, len(AXIS_PARAMETERS)), np.nan),
+                np.full((levels, 2), np.nan),
+            ),
+            "backbone": self._backbone_rows(
+                np.full((self.ctx.nst, levels + 1, 13), np.nan),
+                np.full((self.ctx.nst, levels + 1, 2), np.nan),
+            ),
+        }
+        if self.include_curvesplus_axis_steps:
+            templates["curvesplus_inter_base_pair"] = templates["local_inter_base_pair"]
+        if self.include_fit_quality:
+            templates["base_fit_quality"] = self._base_fit_quality_rows(
+                np.full((self.ctx.nst, levels), np.nan)
+            )
+        return templates
+
+    @staticmethod
+    def _parameter_rows_from_batch(
+        values: np.ndarray,
+        names: Sequence[str],
+        templates: Sequence[Dict],
+        frame_indices: Sequence[int],
+        times: Sequence[Optional[float]],
+    ) -> List[List[Dict]]:
+        rows_by_frame = []
+        for frame_values, frame_id, time_value in zip(
+            _json_array(values), frame_indices, times
+        ):
+            rows = []
+            for template, row_values in zip(templates, frame_values):
+                row = template.copy()
+                row.update(zip(names, row_values))
+                row["frame"] = frame_id
+                row["time"] = time_value
+                rows.append(row)
+            rows_by_frame.append(rows)
+        return rows_by_frame
+
+    def _backbone_rows_from_batch(
+        self,
+        torsions: np.ndarray,
+        sugar_pucker: np.ndarray,
+        frame_indices: Sequence[int],
+        times: Sequence[Optional[float]],
+    ) -> List[List[Dict]]:
+        templates = self._row_templates["backbone"]
+        strands = np.fromiter((row["strand"] - 1 for row in templates), dtype=int)
+        levels = np.fromiter((row["level"] for row in templates), dtype=int)
+        tor = torsions[:, strands, levels]
+        pucker = sugar_pucker[:, strands, levels]
+        values = np.concatenate(
+            (
+                tor[:, :, 4:6],
+                pucker[:, :, [1, 0]],
+                tor[:, :, 0:3],
+                tor[:, :, 12:13],
+                tor[:, :, 8:10],
+                tor[:, :, 6:8],
+                tor[:, :, 10:12],
+            ),
+            axis=2,
+        )
+        gaps = np.fromiter((row["gap"] for row in templates), dtype=bool)
+        if np.any(gaps):
+            values[:, gaps] = np.nan
+
+        finite_by_frame = np.isfinite(values)
+        complete_by_frame = np.all(finite_by_frame, axis=2)
+        pucker_by_frame = np.full(values.shape[:2], None, dtype=object)
+        phase = values[:, :, 2]
+        finite_phase = finite_by_frame[:, :, 2]
+        if np.any(finite_phase):
+            pucker_indices = np.clip(
+                (np.mod(phase[finite_phase], 360.0) / 36.0).astype(int),
+                0,
+                len(SUGAR_PUCKERS) - 1,
+            )
+            pucker_by_frame[finite_phase] = np.asarray(SUGAR_PUCKERS, dtype=object)[pucker_indices]
+
+        rows_by_frame = []
+        for frame_values, frame_finite, frame_complete, frame_pucker, frame_id, time_value in zip(
+            _json_array(values), finite_by_frame, complete_by_frame,
+            pucker_by_frame, frame_indices, times,
+        ):
+            rows = []
+            for template, row_values, finite, complete, pucker_label in zip(
+                templates, frame_values, frame_finite, frame_complete, frame_pucker
+            ):
+                row = template.copy()
+                row.update(zip(BACKBONE_PARAMETERS, row_values))
+                if template["gap"]:
+                    missing = list(BACKBONE_PARAMETERS)
+                    warnings = ["topology_gap", "missing_parameter_values"]
+                    status = "gap"
+                elif complete:
+                    missing = []
+                    warnings = []
+                    status = "complete"
+                else:
+                    missing = [
+                        name for name, is_finite in zip(BACKBONE_PARAMETERS, finite)
+                        if not is_finite
+                    ]
+                    warnings = ["missing_parameter_values"]
+                    status = "partial"
+                row.update({
+                    "pucker": pucker_label,
+                    "valid": not warnings,
+                    "status": status,
+                    "warnings": warnings,
+                    "missing_parameters": missing,
+                    "frame": frame_id,
+                    "time": time_value,
+                })
+                rows.append(row)
+            rows_by_frame.append(rows)
+        return rows_by_frame
+
+    def _materialize_batch_rows(
+        self,
+        frame_indices: Sequence[int],
+        times: Sequence[Optional[float]],
+        local_inter_base: np.ndarray,
+        local_base_base: np.ndarray,
+        local_inter_bp: np.ndarray,
+        axis_tables: Dict[str, np.ndarray],
+        backbone_torsions: np.ndarray,
+        backbone_pucker: np.ndarray,
+        rmsd: np.ndarray,
+        groove_rows_by_frame: Optional[List[List[Dict]]],
+        collect_table_records: bool,
+    ) -> Tuple[List[Dict], Dict[str, List[Dict]]]:
+        frame_indices = [int(frame_id) for frame_id in frame_indices]
+        times = [None if value is None else float(value) for value in times]
+        templates = self._row_templates
+
+        local_templates = templates["local_inter_base"]
+        local_strands = np.fromiter((row["strand"] - 1 for row in local_templates), dtype=int)
+        local_levels = np.fromiter((row["level"] for row in local_templates), dtype=int)
+
+        pair_templates = templates["local_base_base"]
+        pair_levels = np.fromiter((row["level"] for row in pair_templates), dtype=int)
+
+        inter_pair_templates = templates["local_inter_base_pair"]
+        inter_pair_levels = np.fromiter((row["level"] for row in inter_pair_templates), dtype=int)
+
+        axis_templates = templates["curvesplus_base_pair_axis"]
+        axis_levels = np.fromiter((row["level"] for row in axis_templates), dtype=int)
+        axis_values = np.concatenate(
+            (
+                axis_tables["bp_axis"][:, axis_levels],
+                np.min(
+                    axis_tables["axis_support_weights"][:, axis_levels, :2],
+                    axis=2,
+                    keepdims=True,
+                ),
+            ),
+            axis=2,
+        )
+
+        table_rows = {
+            "local_inter_base": self._parameter_rows_from_batch(
+                local_inter_base[:, local_strands, local_levels],
+                STEP_PARAMETERS,
+                local_templates,
+                frame_indices,
+                times,
+            ),
+            "local_base_base": self._parameter_rows_from_batch(
+                local_base_base[:, pair_levels],
+                BASE_BASE_PARAMETERS,
+                pair_templates,
+                frame_indices,
+                times,
+            ),
+            "local_inter_base_pair": self._parameter_rows_from_batch(
+                local_inter_bp[:, inter_pair_levels],
+                STEP_PARAMETERS,
+                inter_pair_templates,
+                frame_indices,
+                times,
+            ),
+            "curvesplus_base_pair_axis": self._parameter_rows_from_batch(
+                axis_values,
+                AXIS_PARAMETERS + ("axis_weight",),
+                axis_templates,
+                frame_indices,
+                times,
+            ),
+            "backbone": self._backbone_rows_from_batch(
+                backbone_torsions,
+                backbone_pucker,
+                frame_indices,
+                times,
+            ),
+        }
+
+        if self.include_grooves:
+            groove_rows = groove_rows_by_frame or [[] for _ in frame_indices]
+            for rows, frame_id, time_value in zip(groove_rows, frame_indices, times):
+                for row in rows:
+                    row["frame"] = frame_id
+                    row["time"] = time_value
+            table_rows["groove"] = groove_rows
+
+        if self.include_curvesplus_axis_steps:
+            table_rows["curvesplus_inter_base_pair"] = self._parameter_rows_from_batch(
+                axis_tables["inter_bp"][:, inter_pair_levels],
+                STEP_PARAMETERS,
+                templates["curvesplus_inter_base_pair"],
+                frame_indices,
+                times,
+            )
+
+        if self.include_fit_quality:
+            fit_templates = templates["base_fit_quality"]
+            fit_strands = np.fromiter((row["strand"] - 1 for row in fit_templates), dtype=int)
+            fit_levels = np.fromiter((row["level"] for row in fit_templates), dtype=int)
+            table_rows["base_fit_quality"] = self._parameter_rows_from_batch(
+                rmsd[:, fit_strands, fit_levels, None],
+                ("rmsd",),
+                fit_templates,
+                frame_indices,
+                times,
+            )
+
+        batch_rows = [
+            {
+                "frame": frame_id,
+                "time": time_value,
+                "dataframes": {
+                    name: rows_by_frame[batch_index]
+                    for name, rows_by_frame in table_rows.items()
+                },
+            }
+            for batch_index, (frame_id, time_value) in enumerate(zip(frame_indices, times))
+        ]
+        table_records = (
+            {
+                name: [row for rows in rows_by_frame for row in rows]
+                for name, rows_by_frame in table_rows.items()
+            }
+            if collect_table_records else {}
+        )
+        return batch_rows, table_records
+
     def analyze_batch(
         self,
         coordinates: np.ndarray,
         frame_indices: Sequence[int],
         times: Sequence[Optional[float]],
         accumulator=None,
+        collect_table_records: bool = True,
     ) -> Tuple[List[Dict], Dict[str, List[Dict]]]:
         coordinates = np.asarray(coordinates, dtype=float)
         if coordinates.ndim != 3 or coordinates.shape[1:] != self.template_molecule.coordinates.shape:
@@ -620,26 +815,13 @@ class BatchCurvesPlusMDAnalyzer:
         local_inter_base = self._local_inter_base(frames)
         local_base_base, pair_frames = self._local_base_base_and_pair_frames(frames)
         axis_tables = self._curvesplus_axis_tables(frames, include_inter_bp=self.include_curvesplus_axis_steps)
+        local_base_base = apply_curvesplus_base_pair_inversion(local_base_base, axis_tables["invert"])
         backbone_torsions, backbone_pucker = self._backbone_values(coordinates)
         groove_rows_by_frame = (
             compute_batch_grooves(self, coordinates, frames, axis_tables, local_inter_base)
             if self.include_grooves else None
         )
 
-        batch_rows = []
-        table_records: Dict[str, List[Dict]] = {
-            "local_inter_base": [],
-            "local_base_base": [],
-            "local_inter_base_pair": [],
-            "curvesplus_base_pair_axis": [],
-            "backbone": [],
-        }
-        if self.include_grooves:
-            table_records["groove"] = []
-        if self.include_curvesplus_axis_steps:
-            table_records["curvesplus_inter_base_pair"] = []
-        if self.include_fit_quality:
-            table_records["base_fit_quality"] = []
         local_inter_bp = self._local_inter_base_pair(pair_frames)
         if accumulator is not None:
             self._accumulate_precomputed_summary(
@@ -654,28 +836,19 @@ class BatchCurvesPlusMDAnalyzer:
                 groove_rows_by_frame,
             )
 
-        for batch_index, (frame_id, time_value) in enumerate(zip(frame_indices, times)):
-            dataframes = {
-                "local_inter_base": self._local_inter_base_rows(local_inter_base[batch_index]),
-                "local_base_base": self._local_base_base_rows(local_base_base[batch_index]),
-                "local_inter_base_pair": self._local_inter_base_pair_rows(local_inter_bp[batch_index]),
-                "curvesplus_base_pair_axis": self._curvesplus_base_pair_axis_rows(axis_tables["bp_axis"][batch_index]),
-                "backbone": self._backbone_rows(backbone_torsions[batch_index], backbone_pucker[batch_index]),
-            }
-            if self.include_grooves:
-                dataframes["groove"] = groove_rows_by_frame[batch_index] if groove_rows_by_frame is not None else []
-            if self.include_curvesplus_axis_steps:
-                dataframes["curvesplus_inter_base_pair"] = self._curvesplus_inter_base_pair_rows(axis_tables["inter_bp"][batch_index])
-            if self.include_fit_quality:
-                dataframes["base_fit_quality"] = self._base_fit_quality_rows(rmsd[batch_index])
-            for rows in dataframes.values():
-                for row in rows:
-                    row["frame"] = int(frame_id)
-                    row["time"] = None if time_value is None else float(time_value)
-            for name, rows in dataframes.items():
-                table_records[name].extend(rows)
-            batch_rows.append({"frame": int(frame_id), "time": None if time_value is None else float(time_value), "dataframes": dataframes})
-        return batch_rows, table_records
+        return self._materialize_batch_rows(
+            frame_indices,
+            times,
+            local_inter_base,
+            local_base_base,
+            local_inter_bp,
+            axis_tables,
+            backbone_torsions,
+            backbone_pucker,
+            rmsd,
+            groove_rows_by_frame,
+            collect_table_records,
+        )
 
     def accumulate_batch_summary(
         self,
@@ -700,6 +873,7 @@ class BatchCurvesPlusMDAnalyzer:
         local_inter_base = self._local_inter_base(frames)
         local_base_base, pair_frames = self._local_base_base_and_pair_frames(frames)
         axis_tables = self._curvesplus_axis_tables(frames, include_inter_bp=self.include_curvesplus_axis_steps)
+        local_base_base = apply_curvesplus_base_pair_inversion(local_base_base, axis_tables["invert"])
         backbone_torsions, backbone_pucker = self._backbone_values(coordinates)
         local_inter_bp = self._local_inter_base_pair(pair_frames)
         groove_rows_by_frame = (
@@ -735,7 +909,12 @@ class BatchCurvesPlusMDAnalyzer:
         self._accumulate_local_inter_base_summary(accumulator, local_inter_base)
         self._accumulate_local_base_base_summary(accumulator, local_base_base, batch)
         self._accumulate_local_inter_base_pair_summary(accumulator, "local_inter_base_pair", local_inter_bp, batch)
-        self._accumulate_axis_summary(accumulator, axis_tables["bp_axis"], batch)
+        self._accumulate_axis_summary(
+            accumulator,
+            axis_tables["bp_axis"],
+            axis_tables["axis_support_weights"],
+            batch,
+        )
         self._accumulate_backbone_summary(accumulator, backbone_torsions, backbone_pucker)
         if self.include_grooves:
             accumulator.ensure_table("groove")
@@ -809,11 +988,22 @@ class BatchCurvesPlusMDAnalyzer:
                 data,
             )
 
-    def _accumulate_axis_summary(self, accumulator, values: np.ndarray, batch: int) -> None:
+    def _accumulate_axis_summary(
+        self,
+        accumulator,
+        values: np.ndarray,
+        support: np.ndarray,
+        batch: int,
+    ) -> None:
         accumulator.ensure_table("curvesplus_base_pair_axis")
-        empty = np.full((batch, len(AXIS_PARAMETERS)), np.nan, dtype=float)
+        names = AXIS_PARAMETERS + ("axis_weight",)
+        empty = np.full((batch, len(names)), np.nan, dtype=float)
         for sequence_index, level in enumerate(self.primary_levels, start=1):
-            data = values[:, level, :] if self._has_level(1, level) else empty
+            data = (
+                np.column_stack((values[:, level, :], np.min(support[:, level, :2], axis=1)))
+                if self._has_level(1, level)
+                else empty
+            )
             accumulator.add_values(
                 "curvesplus_base_pair_axis",
                 {
@@ -822,16 +1012,13 @@ class BatchCurvesPlusMDAnalyzer:
                     "level": level,
                     "duplex": self._duplex_id(level),
                 },
-                AXIS_PARAMETERS,
+                names,
                 data,
             )
 
     def _accumulate_backbone_summary(self, accumulator, torsions: np.ndarray, sugar_pucker: np.ndarray) -> None:
         accumulator.ensure_table("backbone")
-        names = (
-            "c1_c2", "c2_c3", "phase", "amplitude", "c1_prime", "c2_prime",
-            "c3_prime", "chi", "gamma", "delta", "epsilon", "zeta", "alpha", "beta",
-        )
+        names = BACKBONE_PARAMETERS
         for strand in range(self.ctx.nst):
             for level in range(1, self.ctx.nux + 1):
                 if not self._has_level(strand, level):
@@ -988,7 +1175,7 @@ class BatchCurvesPlusMDAnalyzer:
     def _local_inter_base(self, frames: np.ndarray) -> np.ndarray:
         batch = frames.shape[0]
         values = np.full((batch, self.ctx.nst, self.ctx.nux + 1, 6), np.nan, dtype=float)
-        oriented = self._continuous_oriented_strand_frames(frames)
+        oriented = self._oriented_strand_frames(frames)
         records = [
             (strand, level)
             for strand in range(self.ctx.nst)
@@ -1018,7 +1205,9 @@ class BatchCurvesPlusMDAnalyzer:
             values[:, strand, level - 1, :] = step[:, index, :]
         return values
 
-    def _continuous_oriented_strand_frames(self, frames: np.ndarray) -> np.ndarray:
+    def _oriented_strand_frames(self, frames: np.ndarray) -> np.ndarray:
+        # Standard fitted axes are chemically directed; a frayed frame must
+        # not select a sign-equivalent branch for the rest of its strand.
         oriented = frames.copy()
         for strand in range(1, self.ctx.nst):
             if self.ctx.idr[strand] < 0:
@@ -1028,27 +1217,6 @@ class BatchCurvesPlusMDAnalyzer:
                 oriented[:, strand, :, 0, :] *= -1.0
                 oriented[:, strand, :, 1, :] *= -1.0
 
-        batch = frames.shape[0]
-        for strand in range(self.ctx.nst):
-            previous_axes = None
-            previous_valid = np.zeros(batch, dtype=bool)
-            for level in range(1, self.ctx.nux + 1):
-                if not self._has_level(strand, level):
-                    previous_axes = None
-                    previous_valid[:] = False
-                    continue
-                axes = oriented[:, strand, level, :3, :]
-                finite = np.all(np.isfinite(axes), axis=(1, 2))
-                if previous_axes is not None:
-                    candidates = np.einsum("fij,bjk->fbik", SIGN_FLIPS, axes)
-                    scores = np.einsum("bij,fbij->bf", previous_axes, candidates)
-                    best = np.argmax(scores, axis=1)
-                    selected = candidates[best, np.arange(batch)]
-                    use = previous_valid & finite
-                    oriented[use, strand, level, :3, :] = selected[use]
-                    axes = oriented[:, strand, level, :3, :]
-                previous_axes = axes.copy()
-                previous_valid = finite
         return oriented
 
     def _local_base_base_and_pair_frames(self, frames: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -1122,10 +1290,20 @@ class BatchCurvesPlusMDAnalyzer:
     def _curvesplus_axis_tables(self, frames: np.ndarray, include_inter_bp: bool = False) -> Dict[str, np.ndarray]:
         ref = self._curvesplus_reference_frames(frames)
         upm = self._curvesplus_base_pair_frames(ref)
-        uvw = self._curvesplus_smoothed_axis(ref, upm)
+        support = axis_support_weights(
+            ref,
+            self.ctx.li[:self.ctx.nux + 1],
+            enabled=bool(self.ctx.cfg.axis_weighting),
+        )
+        uvw = self._curvesplus_smoothed_axis(ref, upm, support)
         invert = self._curvesplus_inversion_flags(upm)
         bp_axis = self._curvesplus_bp_axis_values(upm, uvw, invert)
-        tables = {"bp_axis": bp_axis, "axis_frames": uvw}
+        tables = {
+            "bp_axis": bp_axis,
+            "axis_frames": uvw,
+            "invert": invert,
+            "axis_support_weights": support,
+        }
         if include_inter_bp:
             tables["inter_bp"] = self._curvesplus_inter_base_pair(upm, invert)
         return tables
@@ -1178,23 +1356,56 @@ class BatchCurvesPlusMDAnalyzer:
             upm[:, second_only] = ref[:, second_only, 1]
         return upm
 
-    def _curvesplus_smoothed_axis(self, ref: np.ndarray, upm: np.ndarray) -> np.ndarray:
+    def _curvesplus_smoothed_axis(
+        self,
+        ref: np.ndarray,
+        upm: np.ndarray,
+        support: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         batch = ref.shape[0]
         axis_sum = np.zeros((batch, self.ctx.nux + 1, 3), dtype=float)
         point_sum = np.zeros((batch, self.ctx.nux + 1, 3), dtype=float)
         counts = np.zeros((batch, self.ctx.nux + 1), dtype=float)
+        if support is None:
+            support = np.ones((batch, self.ctx.nux + 1, self.ctx.nst), dtype=float)
+        support = np.asarray(support, dtype=float)[:, :self.ctx.nux + 1, :self.ctx.nst]
+        level_support = np.max(support, axis=2)
+        edge_lowers = []
+        edge_uppers = []
+        edge_strands = []
+        edge_weights = []
         for upper in range(2, self.ctx.nux + 1):
             lower = upper - 1
             for strand in range(self.ctx.nst):
                 if not (self._has_level(strand, lower) and self._has_level(strand, upper)):
                     continue
-                axis, point = self._curvesplus_screw_axis(ref[:, lower, strand], ref[:, upper, strand])
+                edge_weight = np.minimum(support[:, lower, strand], support[:, upper, strand])
+                if np.any(edge_weight > 0.0):
+                    edge_lowers.append(lower)
+                    edge_uppers.append(upper)
+                    edge_strands.append(strand)
+                    edge_weights.append(edge_weight)
+
+        if edge_lowers:
+            lower_indices = np.asarray(edge_lowers, dtype=int)
+            upper_indices = np.asarray(edge_uppers, dtype=int)
+            strand_indices = np.asarray(edge_strands, dtype=int)
+            edge_axes, edge_points = self._curvesplus_screw_axis(
+                ref[:, lower_indices, strand_indices],
+                ref[:, upper_indices, strand_indices],
+            )
+            for edge_index, (lower, upper, edge_weight) in enumerate(zip(
+                edge_lowers, edge_uppers, edge_weights
+            )):
+                active = edge_weight > 0.0
+                axis = edge_axes[:, edge_index]
+                point = edge_points[:, edge_index]
                 for level in (lower, upper):
                     origin = upm[:, level, 3, :]
                     projected = point + np.sum((origin - point) * axis, axis=1, keepdims=True) * axis
-                    axis_sum[:, level, :] += axis
-                    point_sum[:, level, :] += projected
-                    counts[:, level] += 1.0
+                    axis_sum[active, level, :] += axis[active] * edge_weight[active, None]
+                    point_sum[active, level, :] += projected[active] * edge_weight[active, None]
+                    counts[active, level] += edge_weight[active]
 
         averaged = np.zeros((batch, self.ctx.nux + 1, 6), dtype=float)
         valid = counts > 0
@@ -1217,58 +1428,71 @@ class BatchCurvesPlusMDAnalyzer:
             weights[offset] = weight
             weights[-offset] = weight
 
-        for level in range(1, self.ctx.nux + 1):
-            origin = upm[:, level, 3, :]
-            level_axis_sum = np.zeros((batch, 3), dtype=float)
-            level_point_sum = np.zeros((batch, 3), dtype=float)
-            weight_sum = np.zeros(batch, dtype=float)
-            for offset in range(-width, width + 1):
-                source = level + offset
-                if source < 1 or source > self.ctx.nux:
-                    continue
-                axis = averaged[:, source, :3]
-                point = averaged[:, source, 3:]
-                source_valid = np.linalg.norm(axis, axis=1) > 1e-12
-                if not np.any(source_valid):
-                    continue
-                weight = weights[offset]
-                projected = point + np.sum((origin - point) * axis, axis=1, keepdims=True) * axis
-                level_axis_sum[source_valid] += axis[source_valid] * weight
-                level_point_sum[source_valid] += projected[source_valid] * weight
-                weight_sum[source_valid] += weight
-            axis = _unit(level_axis_sum, upm[:, level, 2, :])
-            point = np.divide(level_point_sum, weight_sum[:, None], out=np.full_like(level_point_sum, np.nan), where=weight_sum[:, None] > 0)
-            point = point + np.sum((origin - point) * axis, axis=1, keepdims=True) * axis
-            uvw[:, level, 2, :] = axis
-            uvw[:, level, 3, :] = point
+        levels = np.arange(1, self.ctx.nux + 1)
+        origins = upm[:, levels, 3, :]
+        level_axis_sum = np.zeros((batch, self.ctx.nux, 3), dtype=float)
+        level_point_sum = np.zeros_like(level_axis_sum)
+        weight_sum = np.zeros((batch, self.ctx.nux), dtype=float)
+        unsupported_prefix = np.concatenate((
+            np.zeros((batch, 1), dtype=int),
+            np.cumsum(level_support <= 0.0, axis=1),
+        ), axis=1)
+        for offset in range(-width, width + 1):
+            sources = levels + offset
+            in_bounds = (sources >= 1) & (sources <= self.ctx.nux)
+            safe_sources = np.clip(sources, 1, self.ctx.nux)
+            lower = np.minimum(levels, safe_sources)
+            upper = np.maximum(levels, safe_sources)
+            connected = (
+                unsupported_prefix[:, upper + 1] - unsupported_prefix[:, lower] == 0
+            ) & in_bounds[None, :]
+            axis = averaged[:, safe_sources, :3]
+            point = averaged[:, safe_sources, 3:]
+            source_valid = (np.linalg.norm(axis, axis=2) > 1e-12) & connected
+            if not np.any(source_valid):
+                continue
+            weight = weights[offset] * level_support[:, safe_sources]
+            projected = point + np.sum((origins - point) * axis, axis=2, keepdims=True) * axis
+            level_axis_sum[source_valid] += axis[source_valid] * weight[source_valid, None]
+            level_point_sum[source_valid] += projected[source_valid] * weight[source_valid, None]
+            weight_sum[source_valid] += weight[source_valid]
+
+        axis = _unit(level_axis_sum, upm[:, levels, 2, :])
+        point = np.divide(
+            level_point_sum,
+            weight_sum[:, :, None],
+            out=np.full_like(level_point_sum, np.nan),
+            where=weight_sum[:, :, None] > 0,
+        )
+        point = point + np.sum((origins - point) * axis, axis=2, keepdims=True) * axis
+        unsupported = level_support[:, levels] <= 0.0
+        axis[unsupported] = np.nan
+        point[unsupported] = np.nan
+        uvw[:, levels, 2, :] = axis
+        uvw[:, levels, 3, :] = point
         return uvw
 
     def _curvesplus_screw_axis(self, first: np.ndarray, second: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        matrix = _rotation_matrix_first_to_second(first[:, :3, :], second[:, :3, :])
-        rotvec = Rotation.from_matrix(matrix).as_rotvec()
-        theta = np.linalg.norm(rotvec, axis=1)
-        vector = second[:, 3, :] - first[:, 3, :]
+        matrix = _rotation_matrix_first_to_second(first[..., :3, :], second[..., :3, :])
+        rotvec = Rotation.from_matrix(matrix.reshape(-1, 3, 3)).as_rotvec().reshape(
+            matrix.shape[:-2] + (3,)
+        )
+        theta = np.linalg.norm(rotvec, axis=-1)
+        vector = second[..., 3, :] - first[..., 3, :]
         axis = np.zeros_like(vector)
         small = theta < 1e-10
         if np.any(~small):
-            axis[~small] = rotvec[~small] / theta[~small, None]
+            axis[~small] = rotvec[~small] / theta[~small][:, None]
         if np.any(small):
-            axis[small] = _unit(vector[small], first[small, 2, :])
-        axial_distance = np.sum(axis * vector, axis=1, keepdims=True)
+            axis[small] = _unit(vector[small], first[..., 2, :][small])
+        axial_distance = np.sum(axis * vector, axis=-1, keepdims=True)
         half_perp = (vector - axial_distance * axis) / 2.0
-        point = (first[:, 3, :] + second[:, 3, :]) / 2.0
+        point = (first[..., 3, :] + second[..., 3, :]) / 2.0
         if np.any(~small):
-            point[~small] += np.cross(axis[~small], half_perp[~small]) / np.tan(theta[~small, None] / 2.0)
+            point[~small] += np.cross(axis[~small], half_perp[~small]) / np.tan(
+                theta[~small][:, None] / 2.0
+            )
         return axis, point
-
-    def _curvesplus_axis_parameter_frames(self, upm: np.ndarray, uvw: np.ndarray) -> np.ndarray:
-        axis_upm = upm.copy()
-        for level in range(1, self.ctx.nux + 1):
-            dot = np.sum(axis_upm[:, level, 2, :] * uvw[:, level, 2, :], axis=1)
-            flip = dot < 0.0
-            axis_upm[flip, level, 1, :] *= -1.0
-            axis_upm[flip, level, 2, :] *= -1.0
-        return axis_upm
 
     def _curvesplus_inversion_flags(self, upm: np.ndarray) -> np.ndarray:
         batch = upm.shape[0]
@@ -1354,7 +1578,7 @@ class BatchCurvesPlusMDAnalyzer:
     def _backbone_values(self, coordinates: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         batch = coordinates.shape[0]
         n3 = self.ctx.nux + 2
-        store = np.full((batch, self.ctx.nst, n3, 16), 999.0, dtype=float)
+        store = np.full((batch, self.ctx.nst, n3, 16), np.nan, dtype=float)
         tasks = self.backbone_tasks
 
         if tasks.torsion_atoms.size:
@@ -1376,8 +1600,8 @@ class BatchCurvesPlusMDAnalyzer:
             )
             store[:, tasks.angle_strands, tasks.angle_levels, tasks.angle_indices] = values
 
-        torsions = np.full((batch, self.ctx.nst, n3, 13), 999.0, dtype=float)
-        sugar_pucker = np.full((batch, self.ctx.nst, n3, 2), 999.0, dtype=float)
+        torsions = np.full((batch, self.ctx.nst, n3, 13), np.nan, dtype=float)
+        sugar_pucker = np.full((batch, self.ctx.nst, n3, 2), np.nan, dtype=float)
         torsions[:, :, :, 0:6] = store[:, :, :, 0:6]
         torsions[:, :, :, 6:13] = store[:, :, :, 9:16]
 
@@ -1394,20 +1618,20 @@ class BatchCurvesPlusMDAnalyzer:
                 ],
                 axis=2,
             )
-            valid = np.all(np.isfinite(v), axis=2) & ~np.any(v >= 900.0, axis=2)
+            valid = np.all(np.isfinite(v), axis=2)
             if np.any(valid):
                 theta = np.radians(144.0 * np.arange(5, dtype=float))
                 a = (2.0 / 5.0) * np.sum(v * np.cos(theta), axis=2)
                 b = (-2.0 / 5.0) * np.sum(v * np.sin(theta), axis=2)
                 amp = np.sqrt(a * a + b * b)
-                phase = np.full_like(amp, 999.0)
+                phase = np.full_like(amp, np.nan)
                 nonzero = valid & (amp > 0.0)
                 if np.any(nonzero):
                     cp = np.clip(a[nonzero] / amp[nonzero], -1.0, 1.0)
                     phase_nonzero = np.degrees(np.arccos(cp))
                     phase_nonzero[b[nonzero] < 0.0] = 360.0 - phase_nonzero[b[nonzero] < 0.0]
                     phase[nonzero] = phase_nonzero
-                amp_out = np.full_like(amp, 999.0)
+                amp_out = np.full_like(amp, np.nan)
                 amp_out[valid] = amp[valid]
                 sugar_pucker[:, strands, levels, 0] = amp_out
                 sugar_pucker[:, strands, levels, 1] = phase
@@ -1419,10 +1643,7 @@ class BatchCurvesPlusMDAnalyzer:
         for strand in range(self.ctx.nst):
             for level in range(1, self.ctx.nux + 1):
                 if not self._has_level(strand, level):
-                    missing = [
-                        "c1_c2", "c2_c3", "phase", "amplitude", "c1_prime", "c2_prime",
-                        "c3_prime", "chi", "gamma", "delta", "epsilon", "zeta", "alpha", "beta",
-                    ]
+                    missing = list(BACKBONE_PARAMETERS)
                     rows.append({
                         "strand": strand + 1, "level": level,
                         "residue_name": None, "residue_id": None, "chain_id": None,
@@ -1440,7 +1661,12 @@ class BatchCurvesPlusMDAnalyzer:
                 insertion_code = str(self.template_molecule.insertion_codes[atom_idx]).strip() if self.template_molecule.insertion_codes is not None else ""
                 tor = torsions[strand, level]
                 pucker = sugar_pucker[strand, level]
-                phase = self._json_number(pucker[1])
+                raw_parameters = np.asarray([
+                    tor[4], tor[5], pucker[1], pucker[0], tor[0], tor[1], tor[2],
+                    tor[12], tor[8], tor[9], tor[6], tor[7], tor[10], tor[11],
+                ], dtype=float)
+                parameters = _parameter_row(raw_parameters, BACKBONE_PARAMETERS)
+                phase = parameters["phase"]
                 pucker_label = None
                 if phase is not None:
                     pucker_index = int((phase % 360.0) / 36.0)
@@ -1454,27 +1680,10 @@ class BatchCurvesPlusMDAnalyzer:
                     "chain_id": chain_id,
                     "insertion_code": insertion_code,
                     "gap": False,
-                    "c1_c2": self._json_number(tor[4]),
-                    "c2_c3": self._json_number(tor[5]),
-                    "phase": phase,
-                    "amplitude": self._json_number(pucker[0]),
                     "pucker": pucker_label,
-                    "c1_prime": self._json_number(tor[0]),
-                    "c2_prime": self._json_number(tor[1]),
-                    "c3_prime": self._json_number(tor[2]),
-                    "chi": self._json_number(tor[12]),
-                    "gamma": self._json_number(tor[8]),
-                    "delta": self._json_number(tor[9]),
-                    "epsilon": self._json_number(tor[6]),
-                    "zeta": self._json_number(tor[7]),
-                    "alpha": self._json_number(tor[10]),
-                    "beta": self._json_number(tor[11]),
+                    **parameters,
                 }
-                parameter_names = (
-                    "c1_c2", "c2_c3", "phase", "amplitude", "c1_prime", "c2_prime",
-                    "c3_prime", "chi", "gamma", "delta", "epsilon", "zeta", "alpha", "beta",
-                )
-                missing_parameters = [name for name in parameter_names if row[name] is None]
+                missing_parameters = [name for name in BACKBONE_PARAMETERS if row[name] is None]
                 warnings = ["missing_parameter_values"] if missing_parameters else []
                 row.update({
                     "valid": not warnings,
@@ -1504,7 +1713,7 @@ class BatchCurvesPlusMDAnalyzer:
             number = float(value)
         except (TypeError, ValueError):
             return None
-        return number if np.isfinite(number) and number < 900.0 else None
+        return number if np.isfinite(number) else None
 
     def _curvesplus_inter_base_pair_rows(self, values: np.ndarray) -> List[Dict]:
         return self._local_inter_base_pair_rows(values)
@@ -1579,17 +1788,19 @@ class BatchCurvesPlusMDAnalyzer:
             ))
         return rows
 
-    def _curvesplus_base_pair_axis_rows(self, values: np.ndarray) -> List[Dict]:
+    def _curvesplus_base_pair_axis_rows(self, values: np.ndarray, support: np.ndarray) -> List[Dict]:
         rows = []
         for sequence_index, level in enumerate(self.primary_levels, start=1):
-            rows.append(_parameter_row(
+            row = _parameter_row(
                 values[level] if self._has_level(1, level) else None,
                 AXIS_PARAMETERS,
                 partner_strand=2,
                 sequence_index=sequence_index,
                 level=level,
                 duplex=self._duplex_id(level),
-            ))
+            )
+            row["axis_weight"] = float(np.min(support[level, :2]))
+            rows.append(row)
         return rows
 
     def _has_level(self, strand: int, level: int) -> bool:

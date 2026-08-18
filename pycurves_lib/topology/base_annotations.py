@@ -4,10 +4,37 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from pycurves_lib.io.base_reference import (
+    BaseFrameFitter,
+    BaseReferenceLibrary,
+    is_fitted_cww_pose,
+    relative_base_frame_geometry,
+)
 from pycurves_lib.data.modified_bases import is_modified_base, parent_base_name
+from pycurves_lib.topology.lw_exemplars import (
+    LWClassification,
+    get_lw_exemplar_library,
+)
 
 WC_PAIRS = {("A", "T"), ("T", "A"), ("A", "U"), ("U", "A"), ("G", "C"), ("C", "G")}
-WOBBLE_PAIRS = {("G", "U"), ("U", "G"), ("I", "C"), ("C", "I"), ("I", "U"), ("U", "I"), ("I", "A"), ("A", "I")}
+WOBBLE_PAIRS = {
+    ("G", "T"), ("T", "G"), ("G", "U"), ("U", "G"),
+    ("I", "C"), ("C", "I"), ("I", "U"), ("U", "I"),
+    ("I", "A"), ("A", "I"),
+}
+HOOGSTEEN_BASE_SETS = {frozenset(("A", "T")), frozenset(("A", "U")), frozenset(("G", "C"))}
+HOOGSTEEN_PURINES = {"A", "G"}
+PAIRING_MODE_LABELS = {
+    "watson_crick": "Watson-Crick",
+    "reverse_watson_crick": "reverse Watson-Crick",
+    "hoogsteen": "Hoogsteen",
+    "reverse_hoogsteen": "reverse Hoogsteen",
+    "wobble": "wobble",
+    "other_noncanonical": "other noncanonical",
+}
+PAIRING_MODES = frozenset(PAIRING_MODE_LABELS)
+CLASSIFICATION_STATUSES = frozenset({"assigned", "possible", "unassigned", "conflict"})
+PAIR_STATUSES = frozenset({"present", "absent", "uncertain"})
 HOOGSTEEN_CONTACT_CUTOFF = 3.7
 WATSON_CONTACT_PRESENT_CUTOFF = 3.3
 EDGE_CONTACT_CUTOFF = 3.8
@@ -19,7 +46,6 @@ CANONICAL_WC_CONTACTS = {
     ("A", "U"): (("N1", "N3"), ("N6", "O4")),
     ("G", "C"): (("N1", "N3"), ("N2", "O2"), ("O6", "N4")),
 }
-SYN_CHI_LIMIT = 90.0
 
 # Edge buckets are the only chemistry vocabulary used by pyCurves frame
 # construction.  Pyrimidine C-H is folded into H for internal use.
@@ -27,32 +53,32 @@ BASE_EDGE_ATOMS = {
     "A": {
         "W": {"N1", "N6"},
         "H": {"N6", "N7", "C8"},
-        "S": {"N3", "C2"},
+        "S": {"N3", "C2", "O2'", "O2*"},
     },
     "G": {
         "W": {"N1", "N2", "O6"},
         "H": {"O6", "N7", "C8"},
-        "S": {"N2", "N3", "C2"},
+        "S": {"N2", "N3", "C2", "O2'", "O2*"},
     },
     "I": {
         "W": {"N1", "O6"},
         "H": {"O6", "N7", "C8"},
-        "S": {"N3", "C2"},
+        "S": {"N3", "C2", "O2'", "O2*"},
     },
     "C": {
         "W": {"O2", "N3", "N4"},
         "H": {"C5", "C6"},
-        "S": {"O2", "C2"},
+        "S": {"O2", "C2", "O2'", "O2*"},
     },
     "T": {
         "W": {"O2", "N3", "O4"},
         "H": {"C5", "C6", "C7"},
-        "S": {"O2", "C2"},
+        "S": {"O2", "C2", "O2'", "O2*"},
     },
     "U": {
         "W": {"O2", "N3", "O4"},
         "H": {"C5", "C6"},
-        "S": {"O2", "C2"},
+        "S": {"O2", "C2", "O2'", "O2*"},
     },
 }
 EDGE_ORDER = {"W": 0, "H": 1, "S": 2}
@@ -72,7 +98,11 @@ SUGAR_C1_ATOMS = ("C1'", "C1*")
 
 def annotate_context(ctx) -> Dict[str, List[Dict[str, Any]]]:
     """Build pyCurves-native annotations for noncanonical and modified bases."""
+    # Coordinates may change between trajectory frames even when the topology
+    # context is reused, so never retain fitted annotation geometry here.
+    setattr(ctx, "_annotation_standard_base_fit_cache", {})
     base_fit_quality = list(getattr(ctx, "annotations", {}).get("base_fit_quality", []))
+    backbone_links = list(getattr(ctx, "annotations", {}).get("backbone_links", []))
     source_base_pairs = _source_base_pair_annotations(ctx)
     source_by_level = {
         int(row["mapped_level"]): row
@@ -94,6 +124,7 @@ def annotate_context(ctx) -> Dict[str, List[Dict[str, Any]]]:
         "base_fit_quality": base_fit_quality,
         "skipped_shape_parameters": skipped,
         "noncanonical_warnings": warnings,
+        "backbone_links": backbone_links,
     }
     ctx.annotations.update(annotations)
     # Older output paths used these lists to suppress unsupported/noncanonical
@@ -123,9 +154,14 @@ def render_section_m(annotations: Dict[str, List[Dict[str, Any]]]) -> str:
         if (
             not row.get("is_canonical")
             or row.get("has_modified_base")
-            or row.get("geometry_flag")
-            or row.get("frame_mode") == "contact_geometry"
-            or row.get("syn_orientation_reversal")
+            or row.get("diagnostic_flags")
+            or row.get("candidate_mode")
+            or row.get("pair_status") != "present"
+            or row.get("frame_mode") in {
+                "contact_geometry",
+                "provisional_contact_geometry",
+            }
+            or row.get("normal_branch_mode") == "left_handed_cww"
         )
     ]
     source_unusual = [
@@ -150,28 +186,40 @@ def render_section_m(annotations: Dict[str, List[Dict[str, Any]]]) -> str:
             notes = []
             if row.get("has_modified_base"):
                 notes.append("modified")
-            if row.get("geometry_flag"):
-                notes.append(row["geometry_flag"])
-            geometry_label = base_pair_geometry_annotation(row)
-            if geometry_label:
-                notes.append(geometry_label)
-            elif row.get("edge_pair"):
-                notes.append(row["edge_pair"])
-            if row.get("glycosidic_orientation") and not geometry_label:
-                notes.append(f"gly={row['glycosidic_orientation']}")
-            if row.get("strand_direction") and not geometry_label:
-                notes.append(f"dir={row['strand_direction']}")
-            if row.get("syn_orientation_reversal"):
-                conformation_1 = row.get("glycosidic_conformation_1") or "?"
-                conformation_2 = row.get("glycosidic_conformation_2") or "?"
-                notes.extend([
-                    f"chi={conformation_1}/{conformation_2}",
-                    f"LW-default={row.get('lw_default_strand_orientation') or '?'}",
-                    f"local={row.get('effective_local_orientation') or '?'}",
-                    f"frame={row.get('partner_frame_transform') or '?'}",
-                ])
+            pair_status = str(row.get("pair_status") or "present")
+            if pair_status != "present":
+                notes.append(f"status={pair_status}")
+            pairing_mode = str(row.get("pairing_mode") or "").strip()
+            if pairing_mode and pairing_mode != "watson_crick":
+                notes.append(f"mode={pairing_mode_label(pairing_mode)}")
+            candidate_mode = str(row.get("candidate_mode") or "").strip()
+            if candidate_mode:
+                notes.append(f"possible {pairing_mode_label(candidate_mode)}")
+            observed_geometry = base_pair_observed_geometry_annotation(row)
+            if observed_geometry:
+                notes.append(observed_geometry)
+            reference_lw = str(row.get("reference_lw_family") or "").strip()
+            if reference_lw and reference_lw != row.get("observed_lw_family"):
+                notes.append(f"reference=[{reference_lw}]")
+            diagnostics = list(row.get("diagnostic_flags") or [])
+            notes.extend(flag for flag in diagnostics if flag not in notes)
             if row.get("frame_mode") == "contact_geometry":
                 notes.append("contact_geometry_frames")
+            elif row.get("frame_mode") == "provisional_contact_geometry":
+                notes.append("provisional_contact_geometry_frames")
+            candidate_lw = str(row.get("candidate_lw_family") or "").strip()
+            if candidate_lw:
+                notes.append(f"possible [{candidate_lw}]")
+            if row.get("normal_branch_mode") == "left_handed_cww":
+                notes.append("normal_branch=left_handed_cww")
+                notes.append(f"normal_sign={int(row.get('pair_normal_sign', -1)):+d}")
+                states = [
+                    str(row.get(key) or "")
+                    for key in ("glycosidic_state_1", "glycosidic_state_2")
+                ]
+                states = [state for state in states if state]
+                if states:
+                    notes.append(f"chi={'/'.join(states)}")
             if row.get("contact_confidence"):
                 notes.append(f"conf={row['contact_confidence']}")
             contact_count = row.get("contact_count")
@@ -195,15 +243,24 @@ def render_section_m(annotations: Dict[str, List[Dict[str, Any]]]) -> str:
         lines.extend([
             "  Source base-pair annotations not represented as Curves paired levels",
             "",
-            "   Pair  Residues                  Family      Source",
-            "  ----------------------------------------------------------------",
+            "   Pair  Residues                  Pairing mode        Source",
+            "  ------------------------------------------------------------------------",
         ])
         for row in source_unusual:
             residues = f"{row.get('residue_1', '?')} / {row.get('residue_2', '?')}"
             pair_number = row.get("pair_number") or 0
+            pairing_mode = str(row.get("pairing_mode") or "")
+            candidate_mode = str(row.get("candidate_mode") or "")
+            display_mode = (
+                pairing_mode_label(pairing_mode)
+                if pairing_mode
+                else f"possible {pairing_mode_label(candidate_mode)}"
+                if candidate_mode
+                else "unassigned"
+            )
             lines.append(
                 f"  {pair_number:5d}  {residues:<24s} "
-                f"{row.get('pair_family', ''):<11s} {row.get('source', '')}"
+                f"{display_mode:<19s} {row.get('source', '')}"
             )
         lines.append("")
 
@@ -251,6 +308,10 @@ def render_section_l(annotations: Dict[str, List[Dict[str, Any]]]) -> str:
 def base_pair_geometry_tag(row: Dict[str, Any]) -> str:
     """Return a compact cWW/tWH-style tag when edge and orientation are known."""
     manual_tag = str(row.get("manual_geometry_tag") or "").strip()
+    if manual_tag:
+        return manual_tag
+    if "lw_family_confident" in row and not bool(row.get("lw_family_confident")):
+        return ""
     orientation = str(row.get("glycosidic_orientation") or "").strip().lower()
     prefix = {"cis": "c", "trans": "t"}.get(orientation, "")
 
@@ -268,12 +329,203 @@ def base_pair_geometry_tag(row: Dict[str, Any]) -> str:
 
 
 def base_pair_geometry_annotation(row: Dict[str, Any]) -> str:
-    """Return the user-facing Leontis-Westhof geometry label."""
+    """Return the user-facing calculation/reference geometry label."""
     tag = base_pair_geometry_tag(row)
     if tag:
         return f"[{tag}]"
     edge_pair = str(row.get("edge_pair") or "").strip()
     return edge_pair
+
+
+def base_pair_observed_geometry_tag(row: Dict[str, Any]) -> str:
+    """Return only geometry assigned from the current coordinates."""
+    if "observed_lw_family" in row:
+        return str(row.get("observed_lw_family") or "").strip()
+    return base_pair_geometry_tag(row)
+
+
+def base_pair_observed_geometry_annotation(row: Dict[str, Any]) -> str:
+    tag = base_pair_observed_geometry_tag(row)
+    return f"[{tag}]" if tag else ""
+
+
+def pairing_mode_label(mode: str) -> str:
+    """Return the human-readable label for one controlled pairing mode."""
+    return PAIRING_MODE_LABELS.get(str(mode or "").strip(), "")
+
+
+def base_pair_pairing_classification(
+    row: Dict[str, Any],
+    source_assignment: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Classify a present pair without mixing its mode with uncertainty."""
+    stored_mode = str(row.get("pairing_mode") or "").strip()
+    if stored_mode == "other":
+        stored_mode = "other_noncanonical"
+    if stored_mode and stored_mode not in PAIRING_MODES:
+        stored_mode = ""
+
+    base_1 = parent_base_name(str(row.get("parent_base_1") or row.get("base_1") or ""))
+    base_2 = parent_base_name(str(row.get("parent_base_2") or row.get("base_2") or ""))
+    pair_status = str(row.get("pair_status") or "present").strip().lower()
+    if pair_status not in PAIR_STATUSES:
+        pair_status = "uncertain"
+    diagnostics = list(dict.fromkeys(
+        str(flag) for flag in row.get("diagnostic_flags", []) if flag
+    ))
+    if pair_status != "present":
+        candidate = str(row.get("candidate_mode") or "").strip()
+        if candidate not in PAIRING_MODES:
+            candidate = ""
+        return {
+            "pairing_mode": "",
+            "candidate_mode": candidate,
+            "classification_status": "possible" if candidate else "unassigned",
+            "diagnostic_flags": diagnostics,
+        }
+
+    tag = str(row.get("observed_lw_family") or "").strip()
+    if not tag and not row.get("reference_lw_family"):
+        tag = base_pair_geometry_tag(row)
+    geometry_mode = _pairing_mode_from_lw_tag(tag, base_1, base_2)
+    if geometry_mode:
+        diagnostics.extend(
+            _hoogsteen_protonation_diagnostics(geometry_mode, base_1, base_2)
+        )
+        return {
+            "pairing_mode": geometry_mode,
+            "candidate_mode": "",
+            "classification_status": "assigned",
+            "diagnostic_flags": list(dict.fromkeys(diagnostics)),
+        }
+
+    if tag.lower() == "cww":
+        if (base_1, base_2) in WC_PAIRS:
+            mode = "watson_crick"
+        elif (base_1, base_2) in WOBBLE_PAIRS:
+            mode = "wobble"
+        else:
+            mode = "other_noncanonical"
+        return {
+            "pairing_mode": mode,
+            "candidate_mode": "",
+            "classification_status": "assigned",
+            "diagnostic_flags": diagnostics,
+        }
+    if (
+        len(tag) == 3
+        and tag[0].lower() in {"c", "t"}
+        and tag[1].upper() in {"W", "H", "S"}
+        and tag[2].upper() in {"W", "H", "S"}
+    ):
+        return {
+            "pairing_mode": "other_noncanonical",
+            "candidate_mode": "",
+            "classification_status": "assigned",
+            "diagnostic_flags": diagnostics,
+        }
+
+
+    if stored_mode:
+        return {
+            "pairing_mode": stored_mode,
+            "candidate_mode": "",
+            "classification_status": "assigned",
+            "diagnostic_flags": diagnostics,
+        }
+
+    source_assignment = dict(source_assignment or {})
+    source_status = str(source_assignment.get("classification_status") or "").strip()
+    source_mode = str(source_assignment.get("pairing_mode") or "").strip()
+    source_candidate = str(source_assignment.get("candidate_mode") or "").strip()
+    if source_status == "assigned" and source_mode in PAIRING_MODES:
+        return {
+            "pairing_mode": source_mode,
+            "candidate_mode": "",
+            "classification_status": "assigned",
+            "diagnostic_flags": diagnostics,
+        }
+    if source_candidate in PAIRING_MODES:
+        return {
+            "pairing_mode": "",
+            "candidate_mode": source_candidate,
+            "classification_status": "possible",
+            "diagnostic_flags": list(dict.fromkeys(diagnostics + ["source_assignment_uncertain"])),
+        }
+
+    if (base_1, base_2) in WOBBLE_PAIRS:
+        return {
+            "pairing_mode": "",
+            "candidate_mode": "wobble",
+            "classification_status": "possible",
+            "diagnostic_flags": list(dict.fromkeys(diagnostics + ["wobble_identity_without_cww_geometry"])),
+        }
+    if "possible_hoogsteen" in diagnostics:
+        return {
+            "pairing_mode": "",
+            "candidate_mode": "hoogsteen",
+            "classification_status": "possible",
+            "diagnostic_flags": diagnostics,
+        }
+    return {
+        "pairing_mode": "",
+        "candidate_mode": "",
+        "classification_status": "unassigned",
+        "diagnostic_flags": diagnostics,
+    }
+
+
+def base_pair_pairing_mode(row: Dict[str, Any], source_mode: str = "") -> str:
+    """Backward-compatible convenience wrapper returning assigned modes only."""
+    source_assignment = None
+    if source_mode:
+        normalized = str(source_mode).strip()
+        reverse = {
+            "Watson-Crick": "watson_crick",
+            "Hoogsteen": "hoogsteen",
+            "reverse Hoogsteen": "reverse_hoogsteen",
+            "wobble": "wobble",
+            "other": "other_noncanonical",
+            **{mode: mode for mode in PAIRING_MODES},
+        }
+        normalized = reverse.get(normalized, "")
+        if normalized:
+            source_assignment = {
+                "pairing_mode": normalized,
+                "classification_status": "assigned",
+            }
+    return base_pair_pairing_classification(row, source_assignment)["pairing_mode"]
+
+
+def _pairing_mode_from_lw_tag(tag: str, base_1: str, base_2: str) -> str:
+    normalized = str(tag or "").strip()
+    if len(normalized) != 3:
+        return ""
+    orientation = normalized[0].lower()
+    edge_1 = normalized[1].upper()
+    edge_2 = normalized[2].upper()
+    if orientation == "t" and edge_1 == edge_2 == "W":
+        return "reverse_watson_crick"
+    if not _has_classic_hoogsteen_edges(base_1, edge_1, base_2, edge_2):
+        return ""
+    if orientation == "c":
+        return "hoogsteen"
+    if orientation == "t":
+        return "reverse_hoogsteen"
+    return ""
+def _hoogsteen_protonation_diagnostics(
+    mode: str,
+    base_1: str,
+    base_2: str,
+) -> List[str]:
+    if (
+        mode in {"hoogsteen", "reverse_hoogsteen"}
+        and frozenset((base_1, base_2)) == frozenset(("G", "C"))
+    ):
+        return ["cytosine_protonation_unresolved"]
+    return []
+
+
 
 
 def _classify_base_pairs(ctx, source_by_level: Optional[Dict[int, Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
@@ -286,6 +538,13 @@ def _classify_base_pairs(ctx, source_by_level: Optional[Dict[int, Dict[str, Any]
         if len(active) > 2:
             rows.append({
                 "level": level,
+                "pair_id": ":".join(str(value) for value in sorted((
+                    int(_residue_for(ctx, active[0], level)["subunit"]),
+                    int(_residue_for(ctx, active[1], level)["subunit"]),
+                ))),
+                "reference_pair": True,
+                "subunit_1": int(_residue_for(ctx, active[0], level)["subunit"]),
+                "subunit_2": int(_residue_for(ctx, active[1], level)["subunit"]),
                 "strand_1": active[0] + 1,
                 "strand_2": active[1] + 1,
                 "residue_1": _format_residue(_residue_for(ctx, active[0], level)),
@@ -295,15 +554,22 @@ def _classify_base_pairs(ctx, source_by_level: Optional[Dict[int, Dict[str, Any]
                 "parent_base_1": parent_base_name(_residue_for(ctx, active[0], level)["residue_name"]),
                 "parent_base_2": parent_base_name(_residue_for(ctx, active[1], level)["residue_name"]),
                 "pair_family": "ambiguous_topology",
+                "identity_class": "ambiguous_topology",
                 "pair_subtype": f"{len(active)} active strands at this level",
+                "pair_status": "uncertain",
+                "observed_lw_family": "",
+                "reference_lw_family": "",
+                "pairing_mode": "",
+                "candidate_mode": "",
+                "classification_status": "unassigned",
+                "diagnostic_flags": ["ambiguous_topology"],
                 "is_canonical": False,
                 "is_mismatch": False,
                 "is_hoogsteen": False,
                 "has_modified_base": any(is_modified_base(_residue_for(ctx, s, level)["residue_name"]) for s in active),
                 "confidence": "topology_warning",
                 "method": "identity_and_inp_topology",
-                "geometry_flag": "",
-                "shape_parameters_supported": True,
+                "evidence_source": "reference_topology",
                 "shape_skip_reason": "",
             })
             continue
@@ -317,7 +583,6 @@ def _classify_base_pairs(ctx, source_by_level: Optional[Dict[int, Dict[str, Any]
         source_pair = source_by_level.get(level)
         source_hoogsteen = bool(source_pair and source_pair.get("is_hoogsteen"))
         manual_geometry = _pair_geometry_marker(ctx, level, s1 + 1, s2 + 1)
-        marked_hoogsteen = _hoogsteen_marker_matches(ctx, level, s1 + 1, s2 + 1)
         contact_geometry = _contact_geometry_for_pair(
             ctx,
             s1,
@@ -326,94 +591,136 @@ def _classify_base_pairs(ctx, source_by_level: Optional[Dict[int, Dict[str, Any]
             r1,
             r2,
             source_hoogsteen=source_hoogsteen,
-            marked_hoogsteen=marked_hoogsteen,
             canonical_identity=canonical,
             manual_geometry=manual_geometry,
         )
-        geometry_flag = _geometry_flag(ctx, s1, s2, level, contact_geometry)
-        if source_hoogsteen:
-            geometry_flag = "hoogsteen_from_source"
-        elif marked_hoogsteen:
-            geometry_flag = "hoogsteen_from_inp"
-        is_hoogsteen = source_hoogsteen or marked_hoogsteen or geometry_flag == "possible_hoogsteen"
-        if source_hoogsteen:
-            pair_family = "hoogsteen"
-            pair_subtype = "source_annotation"
-            confidence = "source_mmcif"
-            method = "mmcif_ndb_struct_na_base_pair"
-        elif marked_hoogsteen:
-            pair_family = "hoogsteen"
-            pair_subtype = "inp_marker"
-            confidence = "inp_topology"
-            method = "inp_hoogsteen_marker"
-        elif geometry_flag == "possible_hoogsteen":
-            pair_family = "possible_hoogsteen"
-            pair_subtype = contact_geometry.get("edge_pair") or subtype
-            confidence = "heuristic_geometry"
-            method = "identity_and_base_pair_geometry"
-        elif contact_geometry.get("edge_pair") and (
-            family == "mismatch"
-            or (
-                contact_geometry.get("edge_1") == "W"
-                and contact_geometry.get("edge_2") == "W"
-                and contact_geometry.get("glycosidic_orientation") == "trans"
+        diagnostic_flags = _geometry_diagnostics(
+            ctx, s1, s2, level, contact_geometry
+        )
+        pair_status = _pair_status_from_geometry(contact_geometry)
+        observed_lw_family = str(
+            contact_geometry.get("observed_lw_family") or ""
+        )
+        reference_lw_family = str(
+            contact_geometry.get("reference_lw_family")
+            or _source_lw_family_for_strand_order(
+                source_pair, first_strand=s1 + 1
+            )
+        )
+        reference_pairing_mode = (
+            str(source_pair.get("pairing_mode") or "") if source_pair else ""
+        ) or _pairing_mode_from_lw_tag(reference_lw_family, b1, b2)
+        calculation_is_hoogsteen = reference_pairing_mode in {
+            "hoogsteen", "reverse_hoogsteen"
+        }
+        if (
+            pair_status == "present"
+            and observed_lw_family
+            and (
+                family == "mismatch"
+                or observed_lw_family.lower() == "tww"
             )
         ):
             pair_family = "hbonded_noncanonical"
-            pair_subtype = base_pair_geometry_tag(contact_geometry) or contact_geometry.get("edge_pair") or subtype
-            confidence = contact_geometry.get("confidence", "heuristic_geometry")
-            method = "edge_contact_geometry"
+            pair_subtype = observed_lw_family
+            confidence = contact_geometry.get("confidence", "coordinate_geometry")
+            method = "coordinate_geometry"
         else:
             pair_family = family
-            pair_subtype = contact_geometry.get("edge_pair") if contact_geometry.get("frame_mode") == "contact_geometry" else subtype
-            confidence = "identity"
-            method = "identity_and_base_pair_geometry"
+            pair_subtype = subtype
+            confidence = contact_geometry.get("confidence", "identity")
+            method = "identity_and_coordinate_geometry"
         frame_mode = contact_geometry.get(
             "frame_mode",
-            "legacy_canonical" if canonical and not geometry_flag else "fitted_fallback",
+            "legacy_canonical" if canonical else "fitted_fallback",
         )
-        rows.append({
+        frame_basis = contact_geometry.get("frame_basis", "")
+        subunit_1 = int(r1["subunit"])
+        subunit_2 = int(r2["subunit"])
+        pair_id = f"{min(subunit_1, subunit_2)}:{max(subunit_1, subunit_2)}"
+        pair_row = {
+            "pair_id": pair_id,
+            "reference_pair": True,
             "level": level,
             "strand_1": s1 + 1,
             "strand_2": s2 + 1,
+            "subunit_1": subunit_1,
+            "subunit_2": subunit_2,
             "residue_1": _format_residue(r1),
             "residue_2": _format_residue(r2),
             "base_1": b1,
             "base_2": b2,
             "parent_base_1": b1,
             "parent_base_2": b2,
+            "identity_class": family,
             "pair_family": pair_family,
             "pair_subtype": pair_subtype,
-            "is_canonical": canonical and frame_mode == "legacy_canonical" and not geometry_flag and not source_hoogsteen and not marked_hoogsteen,
-            "is_mismatch": family == "mismatch" and not is_hoogsteen,
-            "is_hoogsteen": is_hoogsteen,
+            "pair_status": pair_status,
+            "observed_lw_family": observed_lw_family,
+            "reference_lw_family": reference_lw_family,
+            "candidate_lw_family": contact_geometry.get(
+                "candidate_lw_family", ""
+            ),
+            "pairing_mode": "",
+            "candidate_mode": "",
+            "classification_status": "unassigned",
+            "diagnostic_flags": diagnostic_flags,
+            "reference_pairing_mode": reference_pairing_mode,
+            "reference_classification_status": (
+                source_pair.get("classification_status", "") if source_pair else ""
+            ),
+            "calculation_is_hoogsteen": calculation_is_hoogsteen,
+            "is_canonical": False,
+            "is_mismatch": False,
+            "is_hoogsteen": False,
             "has_modified_base": is_modified_base(r1["residue_name"]) or is_modified_base(r2["residue_name"]),
             "confidence": confidence,
             "method": method,
-            "geometry_flag": geometry_flag,
+            "evidence_source": contact_geometry.get("observed_geometry_source", "coordinates"),
             "edge_1": contact_geometry.get("edge_1", ""),
             "edge_2": contact_geometry.get("edge_2", ""),
             "edge_pair": contact_geometry.get("edge_pair", ""),
             "glycosidic_orientation": contact_geometry.get("glycosidic_orientation", ""),
-            "glycosidic_conformation_1": contact_geometry.get("glycosidic_conformation_1", ""),
-            "glycosidic_conformation_2": contact_geometry.get("glycosidic_conformation_2", ""),
-            "lw_default_strand_orientation": contact_geometry.get("lw_default_strand_orientation", ""),
             "lw_strand_orientation": contact_geometry.get("lw_strand_orientation", ""),
-            "syn_orientation_reversal": contact_geometry.get("syn_orientation_reversal", False),
-            "effective_local_orientation": contact_geometry.get("effective_local_orientation", ""),
             "strand_direction": contact_geometry.get("strand_direction", ""),
             "topology_strand_direction": contact_geometry.get("topology_strand_direction", ""),
-            "partner_frame_transform": contact_geometry.get("partner_frame_transform", ""),
             "frame_mode": frame_mode,
+            "frame_basis": frame_basis,
+            "input_geometry_tag": contact_geometry.get(
+                "input_geometry_tag", ""
+            ),
+            "geometry_resolution_status": contact_geometry.get(
+                "geometry_resolution_status", ""
+            ),
             "contact_atom_pairs": contact_geometry.get("contact_atom_pairs", []),
             "contact_count": contact_geometry.get("contact_count", 0),
             "contact_confidence": contact_geometry.get("confidence", ""),
+            "lw_family_confident": bool(
+                contact_geometry.get("observed_lw_family_confident")
+            ),
             "manual_geometry_tag": contact_geometry.get("manual_geometry_tag", ""),
             "contact_geometry": contact_geometry,
             "source_pair_number": source_pair.get("pair_number") if source_pair else None,
             "shape_parameters_supported": True,
             "shape_skip_reason": "",
-        })
+        }
+        classification = base_pair_pairing_classification(pair_row)
+        pair_row.update(classification)
+        mode = pair_row["pairing_mode"]
+        if mode in {"hoogsteen", "reverse_hoogsteen"}:
+            pair_row["pair_family"] = "hoogsteen"
+        elif mode == "reverse_watson_crick":
+            pair_row["pair_family"] = mode
+        pair_row["is_canonical"] = (
+            pair_status == "present" and mode == "watson_crick"
+        )
+        pair_row["is_mismatch"] = (
+            pair_status == "present" and family == "mismatch"
+        )
+        pair_row["is_hoogsteen"] = mode in {
+            "hoogsteen", "reverse_hoogsteen"
+        }
+        rows.append(pair_row)
     return rows
 
 
@@ -428,19 +735,146 @@ def _pair_family(base_1: str, base_2: str) -> Tuple[str, str, bool]:
     return "mismatch", "noncanonical_identity", False
 
 
-def _geometry_flag(ctx, strand_1: int, strand_2: int, level: int, contact_geometry: Optional[Dict[str, Any]] = None) -> str:
+def _geometry_diagnostics(
+    ctx,
+    strand_1: int,
+    strand_2: int,
+    level: int,
+    contact_geometry: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """Return diagnostic evidence without promoting it to a pair class."""
+    diagnostics: List[str] = []
     try:
         residue_1 = _residue_for(ctx, strand_1, level)
         residue_2 = _residue_for(ctx, strand_2, level)
         if residue_1 is None or residue_2 is None:
-            return ""
-        if contact_geometry and _is_hoogsteen_edge_pair(contact_geometry):
-            return "possible_hoogsteen"
-        if _has_hoogsteen_heavy_atom_contacts(ctx, residue_1, residue_2):
-            return "possible_hoogsteen"
+            return ["missing_residue_geometry"]
+        observed_lw = str(
+            (contact_geometry or {}).get("observed_lw_family") or ""
+        )
+        resolution_status = str(
+            (contact_geometry or {}).get("geometry_resolution_status") or ""
+        )
+        if resolution_status == "unresolved":
+            diagnostics.append("unresolved_lw_geometry")
+            if int((contact_geometry or {}).get("contact_count") or 0) == 1:
+                diagnostics.append("single_independent_contact")
+            candidate_lw = str(
+                (contact_geometry or {}).get("candidate_lw_family") or ""
+            )
+            if candidate_lw:
+                diagnostics.append(f"possible_lw_{candidate_lw.lower()}")
+        if not observed_lw and _has_hoogsteen_heavy_atom_contacts(
+            ctx, residue_1, residue_2
+        ):
+            diagnostics.append("possible_hoogsteen")
     except Exception:
-        return ""
-    return ""
+        diagnostics.append("geometry_evaluation_failed")
+    return diagnostics
+
+
+def _pair_status_from_geometry(contact_geometry: Dict[str, Any]) -> str:
+    """Classify pair presence from current-coordinate evidence only."""
+    fitted = dict(contact_geometry.get("fitted_pair_geometry") or {})
+    eligible = bool(fitted.get("eligible"))
+    contact_count = int(contact_geometry.get("contact_count") or 0)
+    confident_lw = bool(
+        contact_geometry.get("observed_lw_family_confident")
+    )
+    unresolved_contact = (
+        contact_geometry.get("input_geometry_tag") == "unresolved"
+        and contact_geometry.get("frame_mode")
+        == "provisional_contact_geometry"
+    )
+    # Multiple independent edge contacts can establish a real, highly
+    # buckled pair even when the fitted normal-angle envelope is exceeded.
+    if contact_count >= 2 and confident_lw:
+        return "present"
+    if eligible and contact_count >= 1 and unresolved_contact:
+        return "present"
+    if eligible and contact_count >= 1 and (confident_lw or contact_count >= 2):
+        return "present"
+    if eligible or contact_count >= 1:
+        return "uncertain"
+    return "absent"
+
+
+
+def _standard_base_fit_for_residue(ctx, residue: Dict[str, Any]) -> Optional[Dict[str, object]]:
+    """Fit one mapped residue for annotation, independent of calculation convention."""
+    try:
+        subunit = int(residue["subunit"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    cache = getattr(ctx, "_annotation_standard_base_fit_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(ctx, "_annotation_standard_base_fit_cache", cache)
+    if subunit in cache:
+        return cache[subunit]
+
+    result = None
+    try:
+        mol = ctx.molecule
+        boundaries = np.asarray(mol.subunit_boundaries, dtype=int)
+        start = int(boundaries[subunit - 1])
+        end = int(boundaries[subunit])
+        residue_atoms: Dict[str, int] = {}
+        for atom_idx in range(start, end):
+            atom_name = str(mol.atom_names[atom_idx]).strip().upper()
+            residue_atoms.setdefault(atom_name, atom_idx)
+
+        library = getattr(ctx, "_annotation_standard_base_library", None)
+        fitter = getattr(ctx, "_annotation_standard_base_fitter", None)
+        if library is None or fitter is None:
+            library = BaseReferenceLibrary.load("standard")
+            fitter = BaseFrameFitter(library)
+            setattr(ctx, "_annotation_standard_base_library", library)
+            setattr(ctx, "_annotation_standard_base_fitter", fitter)
+
+        base = parent_base_name(residue["residue_name"])
+        template = library.template_for_base(base)
+        if template is not None:
+            result = fitter.fit(template, residue_atoms, mol.coordinates)
+    except (AttributeError, IndexError, TypeError, ValueError):
+        result = None
+
+    cache[subunit] = result
+    return result
+
+
+def _standard_fitted_pair_geometry(
+    ctx,
+    residue_1: Dict[str, Any],
+    residue_2: Dict[str, Any],
+) -> Optional[Dict[str, object]]:
+    fit_1 = _standard_base_fit_for_residue(ctx, residue_1)
+    fit_2 = _standard_base_fit_for_residue(ctx, residue_2)
+    if fit_1 is None or fit_2 is None:
+        return None
+    return relative_base_frame_geometry(fit_1, fit_2)
+
+
+def _lw_exemplar_classification(
+    ctx,
+    residue_1: Dict[str, Any],
+    residue_2: Dict[str, Any],
+) -> Optional[LWClassification]:
+    fit_1 = _standard_base_fit_for_residue(ctx, residue_1)
+    fit_2 = _standard_base_fit_for_residue(ctx, residue_2)
+    if fit_1 is None or fit_2 is None:
+        return None
+    library = getattr(ctx, "_annotation_lw_exemplar_library", None)
+    if library is None:
+        library = get_lw_exemplar_library()
+        setattr(ctx, "_annotation_lw_exemplar_library", library)
+    return library.classify_fits(
+        parent_base_name(residue_1["residue_name"]),
+        fit_1,
+        parent_base_name(residue_2["residue_name"]),
+        fit_2,
+    )
 
 
 def _contact_geometry_for_pair(
@@ -451,7 +885,6 @@ def _contact_geometry_for_pair(
     residue_1: Dict[str, Any],
     residue_2: Dict[str, Any],
     source_hoogsteen: bool,
-    marked_hoogsteen: bool,
     canonical_identity: bool,
     manual_geometry: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
@@ -465,42 +898,122 @@ def _contact_geometry_for_pair(
     edge_1, edge_1_score, edge_1_ambiguous = _dominant_edge(base_1, contact_atoms_1)
     edge_2, edge_2_score, edge_2_ambiguous = _dominant_edge(base_2, contact_atoms_2)
     manual_geometry = dict(manual_geometry or {})
-    manual_requested = bool(manual_geometry)
-    if manual_requested:
+    unresolved_requested = bool(
+        manual_geometry.get("kind") == "unresolved"
+        or str(manual_geometry.get("tag") or "").lower() == "unresolved"
+    )
+    manual_lw_requested = bool(manual_geometry) and not unresolved_requested
+    fitted_geometry = _standard_fitted_pair_geometry(ctx, residue_1, residue_2)
+    fitted_cww = is_fitted_cww_pose(fitted_geometry)
+    lw_classification = _lw_exemplar_classification(ctx, residue_1, residue_2)
+    confident_exemplar = bool(
+        lw_classification is not None and lw_classification.confident
+    )
+    canonical_contact_orientation = _canonical_watson_contact_orientation(
+        base_1, base_2, atom_map_1, atom_map_2
+    )
+    coordinate_orientation = (
+        (lw_classification.glycosidic_orientation if confident_exemplar else "")
+        or ("cis" if fitted_cww else "")
+        or canonical_contact_orientation
+        or _glycosidic_orientation(base_1, base_2, atom_map_1, atom_map_2, contacts)
+    )
+    coordinate_edge_1 = edge_1
+    coordinate_edge_2 = edge_2
+    if confident_exemplar:
+        coordinate_edge_1 = lw_classification.edge_1
+        coordinate_edge_2 = lw_classification.edge_2
+    elif fitted_cww:
+        coordinate_edge_1 = coordinate_edge_2 = "W"
+    has_reliable_coordinate_contacts = (
+        len(contacts) >= MIN_CONTACT_FRAME_PAIRS
+        and bool(coordinate_edge_1)
+        and bool(coordinate_edge_2)
+        and not edge_1_ambiguous
+        and not edge_2_ambiguous
+    )
+    coordinate_trans_ww = bool(
+        coordinate_edge_1 == coordinate_edge_2 == "W"
+        and coordinate_orientation == "trans"
+        and has_reliable_coordinate_contacts
+    )
+    observed_lw_family = (
+        lw_classification.tag
+        if confident_exemplar
+        else "cWW"
+        if fitted_cww
+        else "tWW"
+        if coordinate_trans_ww
+        else ""
+    )
+    observed_lw_family_confident = bool(
+        confident_exemplar or fitted_cww or coordinate_trans_ww
+    )
+    provisional_unresolved = bool(
+        unresolved_requested and not observed_lw_family_confident
+    )
+    topology_strand_direction = _strand_direction(ctx, strand_1, strand_2)
+    candidate_lw_family = ""
+    orientation_prefix = {
+        "cis": "c",
+        "trans": "t",
+    }.get(str(coordinate_orientation).lower(), "")
+    if (
+        provisional_unresolved
+        and orientation_prefix
+        and coordinate_edge_1
+        and coordinate_edge_2
+        and not edge_1_ambiguous
+        and not edge_2_ambiguous
+        and infer_lw_strand_orientation(
+            coordinate_orientation,
+            coordinate_edge_1,
+            coordinate_edge_2,
+        ) == topology_strand_direction
+    ):
+        candidate_lw_family = (
+            f"{orientation_prefix}{coordinate_edge_1}{coordinate_edge_2}"
+        )
+
+    if manual_lw_requested:
         edge_1 = str(manual_geometry.get("edge_1", "")).upper()
         edge_2 = str(manual_geometry.get("edge_2", "")).upper()
         edge_1_ambiguous = False
         edge_2_ambiguous = False
+    elif confident_exemplar:
+        edge_1 = lw_classification.edge_1
+        edge_2 = lw_classification.edge_2
+        edge_1_ambiguous = False
+        edge_2_ambiguous = False
+    elif fitted_cww:
+        edge_1 = edge_2 = "W"
+        edge_1_ambiguous = False
+        edge_2_ambiguous = False
     edge_pair = f"{edge_1}/{edge_2}" if edge_1 and edge_2 else ""
-    glycosidic_conformation_1 = _residue_glycosidic_conformation(
-        ctx, strand_1, level, base_1, atom_map_1
-    )
-    glycosidic_conformation_2 = _residue_glycosidic_conformation(
-        ctx, strand_2, level, base_2, atom_map_2
-    )
-    topology_strand_direction = _strand_direction(ctx, strand_1, strand_2)
-    manual_glycosidic_orientation = manual_geometry.get("glycosidic_orientation", "")
-    canonical_contact_orientation = _canonical_watson_contact_orientation(
-        base_1, base_2, atom_map_1, atom_map_2
+    manual_glycosidic_orientation = (
+        manual_geometry.get("glycosidic_orientation", "")
+        if manual_lw_requested
+        else ""
     )
     glycosidic_orientation = (
-        manual_glycosidic_orientation
-        or canonical_contact_orientation
-        or _glycosidic_orientation(base_1, base_2, atom_map_1, atom_map_2, contacts)
+        manual_glycosidic_orientation or coordinate_orientation
     )
     manual_lw_strand_orientation = (
-        manual_geometry.get("lw_strand_orientation")
-        or manual_geometry.get("strand_direction")
+        (
+            manual_geometry.get("lw_strand_orientation")
+            or manual_geometry.get("strand_direction")
+        )
+        if manual_lw_requested
+        else ""
     )
-    lw_default_strand_orientation = manual_lw_strand_orientation or infer_lw_strand_orientation(
-        glycosidic_orientation,
-        edge_1,
-        edge_2,
-    )
-    effective_local_orientation, syn_orientation_reversal = effective_lw_strand_orientation(
-        lw_default_strand_orientation,
-        glycosidic_conformation_1,
-        glycosidic_conformation_2,
+    lw_strand_orientation = (
+        ""
+        if provisional_unresolved
+        else manual_lw_strand_orientation or infer_lw_strand_orientation(
+            glycosidic_orientation,
+            edge_1,
+            edge_2,
+        )
     )
 
     has_reliable_contacts = (
@@ -510,45 +1023,74 @@ def _contact_geometry_for_pair(
         and not edge_1_ambiguous
         and not edge_2_ambiguous
     )
-    has_manual_frame_contacts = manual_requested and bool(edge_1) and bool(edge_2) and len(contacts) >= MIN_CONTACT_FRAME_PAIRS
-    has_usable_edge_geometry = has_reliable_contacts or has_manual_frame_contacts
-    observed_watson_crick = (
-        has_usable_edge_geometry
-        and edge_1 == "W"
-        and edge_2 == "W"
-        and glycosidic_orientation == "cis"
+    # An explicit LW tag in the input is authoritative even if the raw
+    # coordinate contact finder cannot recover two short atom pairs. The frame
+    # builder can fall back to the complete atoms belonging to those edges.
+    has_manual_frame_geometry = (
+        manual_lw_requested and bool(edge_1) and bool(edge_2)
     )
-    watson_watson_geometry = has_usable_edge_geometry and edge_1 == "W" and edge_2 == "W"
-    forced_noncanonical = bool(source_hoogsteen or marked_hoogsteen)
-    if canonical_identity and observed_watson_crick and not forced_noncanonical:
-        frame_mode = "legacy_canonical"
-    elif canonical_identity and not has_usable_edge_geometry and not forced_noncanonical:
-        frame_mode = "legacy_canonical"
-    elif watson_watson_geometry:
+    has_provisional_contact_geometry = (
+        provisional_unresolved
+        and bool(contacts)
+    )
+    forced_noncanonical = bool(source_hoogsteen)
+    if has_manual_frame_geometry:
+        # cWW is the canonical standard-frame family.  Other directed LW
+        # families, including tWW, use their explicitly requested contact
+        # geometry and its coordinate-derived normal branch.
+        is_cww = (
+            glycosidic_orientation == "cis"
+            and edge_1 == edge_2 == "W"
+        )
+        frame_mode = "fitted_fallback" if is_cww else "contact_geometry"
+    elif unresolved_requested and observed_lw_family_confident:
+        is_cww = observed_lw_family == "cWW"
+        frame_mode = "fitted_fallback" if is_cww else "contact_geometry"
+    elif has_provisional_contact_geometry:
+        frame_mode = "provisional_contact_geometry"
+    elif unresolved_requested:
         frame_mode = "fitted_fallback"
-    elif has_usable_edge_geometry:
-        frame_mode = "contact_geometry"
+    elif canonical_identity and not forced_noncanonical:
+        frame_mode = "legacy_canonical"
     else:
+        # Coordinate-only/source annotations remain descriptive. They must not
+        # silently replace the standard fitted calculation frames.
         frame_mode = "fitted_fallback"
+    frame_basis = (
+        "atom_contact_axis"
+        if frame_mode == "provisional_contact_geometry"
+        else "observed_edge"
+        if frame_mode == "contact_geometry"
+        else ""
+    )
 
-    # The syn-adjusted orientation describes how the LW family relates to the
-    # covalent strand topology. It must not be applied again to fitted or
-    # contact-geometry axes: the observed syn rotation is already present in
-    # those coordinates. Select the partner-frame branch from the LW family.
-    frame_orientation = lw_default_strand_orientation
-    partner_frame_transform = {
-        "parallel": "direct",
-        "antiparallel": "yz_inverted",
-    }.get(frame_orientation, "")
-
-    if manual_requested:
+    contact_supported_trans_ww = bool(
+        edge_1 == edge_2 == "W"
+        and glycosidic_orientation == "trans"
+        and has_reliable_contacts
+    )
+    lw_family_confident = bool(
+        manual_lw_requested
+        or confident_exemplar
+        or fitted_cww
+        or contact_supported_trans_ww
+    )
+    if provisional_unresolved and has_provisional_contact_geometry:
+        confidence = "provisional_atom_contact_geometry"
+    elif provisional_unresolved:
+        confidence = "unresolved_geometry"
+    elif manual_lw_requested:
         confidence = "manual_inp_geometry"
+    elif confident_exemplar:
+        confidence = "fitted_lw_exemplar"
+    elif fitted_cww:
+        confidence = "fitted_standard_frames"
     elif has_reliable_contacts:
         confidence = "edge_contacts"
     elif contacts:
         confidence = "weak_or_ambiguous_contacts"
     elif forced_noncanonical:
-        confidence = "source_or_inp_without_contacts"
+        confidence = "source_without_contacts"
     else:
         confidence = "identity"
 
@@ -561,38 +1103,70 @@ def _contact_geometry_for_pair(
         "edge_1": edge_1,
         "edge_2": edge_2,
         "edge_pair": edge_pair,
+        "observed_lw_family": observed_lw_family,
+        "reference_lw_family": (
+            manual_geometry.get("tag", "") if manual_lw_requested else ""
+        ),
+        "candidate_lw_family": candidate_lw_family,
+        "observed_lw_family_confident": observed_lw_family_confident,
+        "observed_edge_1": coordinate_edge_1,
+        "observed_edge_2": coordinate_edge_2,
+        "observed_glycosidic_orientation": coordinate_orientation,
+        "observed_geometry_source": (
+            "fitted_lw_exemplar"
+            if confident_exemplar
+            else "fitted_standard_frames"
+            if fitted_cww
+            else "coordinates"
+        ),
         "orientation": manual_geometry.get("orientation", ""),
         "glycosidic_orientation": glycosidic_orientation,
-        "glycosidic_conformation_1": glycosidic_conformation_1,
-        "glycosidic_conformation_2": glycosidic_conformation_2,
-        "lw_default_strand_orientation": lw_default_strand_orientation,
-        # Backward-compatible field for the default anti/anti LW table value.
-        "lw_strand_orientation": lw_default_strand_orientation,
-        "syn_orientation_reversal": syn_orientation_reversal,
-        "effective_local_orientation": effective_local_orientation,
-        # Backward-compatible alias used by frame consumers; this is effective local orientation.
-        "strand_direction": effective_local_orientation,
+        "lw_strand_orientation": lw_strand_orientation,
+        "strand_direction": lw_strand_orientation,
         "strand_direction_source": (
-            "lw_geometry_plus_single_syn"
-            if syn_orientation_reversal
-            else manual_geometry.get("strand_direction_source", "")
+            manual_geometry.get("strand_direction_source", "")
             if manual_lw_strand_orientation
-            else "inferred_from_contact_geometry" if lw_default_strand_orientation else ""
+            else "coordinate_provisional"
+            if provisional_unresolved
+            else "inferred_from_contact_geometry" if lw_strand_orientation else ""
         ),
         "topology_strand_direction": topology_strand_direction,
-        "partner_frame_transform": partner_frame_transform,
         "frame_mode": frame_mode,
+        "frame_basis": frame_basis,
         "contact_atom_pairs": contacts,
         "contact_count": len(contacts),
         "confidence": confidence,
+        "geometry_source": (
+            "inp"
+            if manual_lw_requested
+            else "inp_unresolved_coordinates"
+            if unresolved_requested
+            else "fitted_lw_exemplar"
+            if confident_exemplar
+            else "fitted_standard_frames"
+            if fitted_cww
+            else "coordinates"
+        ),
+        "lw_family_confident": lw_family_confident,
+        "lw_exemplar": lw_classification.as_dict() if lw_classification else {},
+        "fitted_pair_geometry": fitted_geometry or {},
         "edge_score_1": edge_1_score,
         "edge_score_2": edge_2_score,
         "edge_1_ambiguous": edge_1_ambiguous,
         "edge_2_ambiguous": edge_2_ambiguous,
-        "manual_geometry_tag": manual_geometry.get("tag", ""),
+        "manual_geometry_tag": (
+            manual_geometry.get("tag", "") if manual_lw_requested else ""
+        ),
+        "input_geometry_tag": (
+            str(manual_geometry.get("tag") or "") if manual_geometry else ""
+        ),
+        "geometry_resolution_status": (
+            "unresolved"
+            if provisional_unresolved
+            else "resolved" if unresolved_requested else ""
+        ),
         "manual_geometry_strand": manual_geometry.get("annotated_strand"),
         "source_hoogsteen": bool(source_hoogsteen),
-        "marked_hoogsteen": bool(marked_hoogsteen),
     }
 
 
@@ -684,54 +1258,6 @@ def _strand_direction(ctx, strand_1: int, strand_2: int) -> str:
         return "unknown"
 
 
-def infer_glycosidic_conformation(base: str, atom_map: Dict[str, np.ndarray]) -> str:
-    """Return syn/anti from the conventional glycosidic chi torsion."""
-    normalized_base = parent_base_name(base)
-    purine = normalized_base in {"A", "G", "I", "P", "R"}
-    o4 = _first_atom_point(atom_map, ("O4'", "O4*", "O1'", "O1*"))
-    c1 = _first_atom_point(atom_map, SUGAR_C1_ATOMS)
-    gly = atom_map.get("N9" if purine else "N1")
-    ring = atom_map.get("C4" if purine else "C2")
-    if o4 is None or c1 is None or gly is None or ring is None:
-        return ""
-    chi = _dihedral_degrees(o4, c1, gly, ring)
-    if chi is None:
-        return ""
-    return "syn" if abs(chi) < SYN_CHI_LIMIT else "anti"
-
-
-def effective_lw_strand_orientation(
-    lw_default_orientation: str,
-    conformation_1: str,
-    conformation_2: str,
-) -> Tuple[str, bool]:
-    """Apply the Leontis-Westhof single-syn reversal to the anti/anti table value."""
-    default = str(lw_default_orientation or "").strip().lower()
-    if default not in {"parallel", "antiparallel"}:
-        return "", False
-    first = str(conformation_1 or "anti").strip().lower()
-    second = str(conformation_2 or "anti").strip().lower()
-    single_syn = (first == "syn") ^ (second == "syn")
-    if not single_syn:
-        return default, False
-    reversed_orientation = "parallel" if default == "antiparallel" else "antiparallel"
-    return reversed_orientation, True
-
-
-def _residue_glycosidic_conformation(
-    ctx,
-    zero_based_strand: int,
-    level: int,
-    base: str,
-    atom_map: Dict[str, np.ndarray],
-) -> str:
-    markers = getattr(ctx, "glycosidic_conformation_markers", {}) or {}
-    explicit = markers.get((zero_based_strand + 1, level))
-    if explicit in {"syn", "anti"}:
-        return explicit
-    return infer_glycosidic_conformation(base, atom_map)
-
-
 def infer_lw_strand_orientation(
     glycosidic_orientation: str,
     edge_1: str,
@@ -770,41 +1296,6 @@ def _canonical_watson_contact_orientation(
         if distance is not None and distance <= EDGE_CONTACT_CUTOFF:
             matches += 1
     return "cis" if matches >= 2 else ""
-
-
-def _first_atom_point(
-    atom_map: Dict[str, np.ndarray],
-    atom_names: Tuple[str, ...],
-) -> Optional[np.ndarray]:
-    for atom_name in atom_names:
-        point = atom_map.get(atom_name)
-        if point is not None:
-            return point
-    return None
-
-
-def _dihedral_degrees(
-    p1: np.ndarray,
-    p2: np.ndarray,
-    p3: np.ndarray,
-    p4: np.ndarray,
-) -> Optional[float]:
-    first = np.asarray(p1, dtype=float)
-    second = np.asarray(p2, dtype=float)
-    third = np.asarray(p3, dtype=float)
-    fourth = np.asarray(p4, dtype=float)
-    b0 = -(second - first)
-    b1 = third - second
-    b2 = fourth - third
-    norm_b1 = float(np.linalg.norm(b1))
-    if norm_b1 <= 1.0e-10:
-        return None
-    b1 /= norm_b1
-    v = b0 - np.dot(b0, b1) * b1
-    w = b2 - np.dot(b2, b1) * b1
-    if float(np.linalg.norm(v)) <= 1.0e-10 or float(np.linalg.norm(w)) <= 1.0e-10:
-        return None
-    return float(np.degrees(np.arctan2(np.dot(np.cross(b1, v), w), np.dot(v, w))))
 
 
 def _glycosidic_orientation(
@@ -920,10 +1411,20 @@ def _is_hoogsteen_edge_pair(contact_geometry: Dict[str, Any]) -> bool:
         return False
     edge_1 = contact_geometry.get("edge_1")
     edge_2 = contact_geometry.get("edge_2")
-    if {edge_1, edge_2} != {"H", "W"}:
+    return _has_classic_hoogsteen_edges(
+        contact_geometry.get("base_1"), edge_1,
+        contact_geometry.get("base_2"), edge_2,
+    )
+
+
+def _has_classic_hoogsteen_edges(base_1: str, edge_1: str, base_2: str, edge_2: str) -> bool:
+    if frozenset((base_1, base_2)) not in HOOGSTEEN_BASE_SETS:
         return False
-    bases = {contact_geometry.get("base_1"), contact_geometry.get("base_2")}
-    return bases in ({"A", "T"}, {"A", "U"}, {"G", "C"})
+    if base_1 in HOOGSTEEN_PURINES:
+        return edge_1 == "H" and edge_2 == "W"
+    if base_2 in HOOGSTEEN_PURINES:
+        return edge_1 == "W" and edge_2 == "H"
+    return False
 
 
 def _pair_geometry_marker(ctx, level: int, strand_1: int, strand_2: int) -> Optional[Dict[str, Any]]:
@@ -1064,16 +1565,141 @@ def _atom_distance(
     return float(np.linalg.norm(coord_1 - coord_2))
 
 
-def _hoogsteen_marker_matches(ctx, level: int, strand_1: int, strand_2: int) -> bool:
-    markers = getattr(ctx, "hoogsteen_markers", set()) or set()
-    if level in markers:
-        return True
-    return (
-        (strand_1, level) in markers
-        or (strand_2, level) in markers
-        or (strand_1, strand_2, level) in markers
-        or (strand_2, strand_1, level) in markers
+def _source_lw_family_for_strand_order(
+    source_pair: Optional[Dict[str, Any]],
+    *,
+    first_strand: int,
+) -> str:
+    if not source_pair:
+        return ""
+    tag = str(source_pair.get("source_lw_family") or "").strip()
+    if len(tag) != 3:
+        return tag
+    try:
+        mapped_first = int(source_pair.get("mapped_strand_1") or 0)
+        mapped_second = int(source_pair.get("mapped_strand_2") or 0)
+    except (TypeError, ValueError):
+        return tag
+    if mapped_second == first_strand and mapped_first != first_strand:
+        return f"{tag[0]}{tag[2]}{tag[1]}"
+    return tag
+
+
+def _source_pairing_assignment(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize source nomenclature while preserving uncertainty/conflicts."""
+    base_1 = parent_base_name(str(row.get("i_residue_name") or ""))
+    base_2 = parent_base_name(str(row.get("j_residue_name") or ""))
+    name = str(row.get("dssr_name") or "").strip()
+    approximate_name = name.startswith("~")
+    compact_name = (
+        name.lower().replace(" ", "").replace("_", "").replace("-", "").lstrip("~")
     )
+    named_mode = ""
+    if compact_name.startswith("rhoogsteen") or "reversehoogsteen" in compact_name:
+        named_mode = "reverse_hoogsteen"
+    elif "hoogsteen" in compact_name:
+        named_mode = "hoogsteen"
+    elif "wobble" in compact_name:
+        named_mode = "wobble"
+
+    tag = str(
+        row.get("hbond_type_leontis_westhof")
+        or row.get("dssr_lw")
+        or ""
+    ).strip()
+    tag_mode = _pairing_mode_from_lw_tag(tag, base_1, base_2)
+    if tag.lower() == "cww":
+        if (base_1, base_2) in WC_PAIRS:
+            tag_mode = "watson_crick"
+        elif (base_1, base_2) in WOBBLE_PAIRS:
+            tag_mode = "wobble"
+        else:
+            tag_mode = "other_noncanonical"
+
+    diagnostics: List[str] = []
+    diagnostics.extend(_hoogsteen_protonation_diagnostics(
+        named_mode or tag_mode, base_1, base_2
+    ))
+    if named_mode and tag_mode and named_mode != tag_mode:
+        return {
+            "pairing_mode": "",
+            "candidate_mode": named_mode,
+            "classification_status": "conflict",
+            "diagnostic_flags": diagnostics + ["source_name_lw_conflict"],
+            "source_lw_family": tag,
+        }
+    if approximate_name and named_mode:
+        return {
+            "pairing_mode": "",
+            "candidate_mode": named_mode,
+            "classification_status": "possible",
+            "diagnostic_flags": diagnostics + ["source_name_approximate"],
+            "source_lw_family": tag,
+        }
+    if named_mode:
+        if compact_name.startswith("swobble"):
+            diagnostics.append("shifted_wobble_variant")
+        return {
+            "pairing_mode": named_mode,
+            "candidate_mode": "",
+            "classification_status": "assigned",
+            "diagnostic_flags": diagnostics,
+            "source_lw_family": tag,
+        }
+    if tag_mode:
+        return {
+            "pairing_mode": tag_mode,
+            "candidate_mode": "",
+            "classification_status": "assigned",
+            "diagnostic_flags": diagnostics,
+            "source_lw_family": tag,
+        }
+
+    hbond_type_28 = str(row.get("hbond_type_28") or "").strip()
+    complementary_hoogsteen = frozenset((base_1, base_2)) in HOOGSTEEN_BASE_SETS
+    if hbond_type_28 in {"23", "24"} and complementary_hoogsteen:
+        saenger_mode = "hoogsteen" if hbond_type_28 == "23" else "reverse_hoogsteen"
+        return {
+            "pairing_mode": saenger_mode,
+            "candidate_mode": "",
+            "classification_status": "assigned",
+            "diagnostic_flags": (
+                _hoogsteen_protonation_diagnostics(saenger_mode, base_1, base_2)
+                + ["source_saenger_classification"]
+            ),
+            "source_lw_family": tag,
+        }
+    if row.get("is_hoogsteen"):
+        return {
+            "pairing_mode": "",
+            "candidate_mode": "hoogsteen",
+            "classification_status": "possible",
+            "diagnostic_flags": (
+                _hoogsteen_protonation_diagnostics("hoogsteen", base_1, base_2)
+                + ["source_hoogsteen_without_ordered_geometry"]
+            ),
+            "source_lw_family": tag,
+        }
+    if (base_1, base_2) in WOBBLE_PAIRS:
+        return {
+            "pairing_mode": "",
+            "candidate_mode": "wobble",
+            "classification_status": "possible",
+            "diagnostic_flags": ["source_wobble_identity_without_cww_geometry"],
+            "source_lw_family": tag,
+        }
+    return {
+        "pairing_mode": "",
+        "candidate_mode": "",
+        "classification_status": "unassigned",
+        "diagnostic_flags": diagnostics,
+        "source_lw_family": tag,
+    }
+
+
+def _source_pairing_mode(row: Dict[str, Any]) -> str:
+    """Return only a definitive controlled source mode."""
+    return _source_pairing_assignment(row)["pairing_mode"]
 
 
 def _source_base_pair_annotations(ctx) -> List[Dict[str, Any]]:
@@ -1107,6 +1733,8 @@ def _source_base_pair_annotations(ctx) -> List[Dict[str, Any]]:
             if mapped_level is not None:
                 break
 
+        source_assignment = _source_pairing_assignment(row)
+        pairing_mode = source_assignment["pairing_mode"]
         annotation = {
             "source": row.get("source", ""),
             "pair_number": row.get("pair_number"),
@@ -1121,10 +1749,24 @@ def _source_base_pair_annotations(ctx) -> List[Dict[str, Any]]:
             "residue_id_2": row.get("j_residue_id"),
             "base_1": parent_base_name(row.get("i_residue_name", "")),
             "base_2": parent_base_name(row.get("j_residue_name", "")),
-            "pair_family": "hoogsteen" if row.get("is_hoogsteen") else "source_annotated",
-            "is_hoogsteen": bool(row.get("is_hoogsteen")),
+            "pair_family": (
+                "hoogsteen"
+                if pairing_mode in {"hoogsteen", "reverse_hoogsteen"}
+                else "source_annotated"
+            ),
+            "pairing_mode": pairing_mode,
+            "candidate_mode": source_assignment["candidate_mode"],
+            "classification_status": source_assignment["classification_status"],
+            "diagnostic_flags": source_assignment["diagnostic_flags"],
+            "source_lw_family": source_assignment["source_lw_family"],
+            "is_hoogsteen": pairing_mode in {
+                "hoogsteen", "reverse_hoogsteen"
+            },
             "hbond_type_28": row.get("hbond_type_28", ""),
             "hbond_type_12": row.get("hbond_type_12", ""),
+            "hbond_type_leontis_westhof": row.get(
+                "hbond_type_leontis_westhof", ""
+            ),
             "opening": row.get("opening"),
             "shear": row.get("shear"),
             "stretch": row.get("stretch"),
@@ -1150,16 +1792,42 @@ def _collect_warnings(ctx, base_pairs, base_fit_quality, source_base_pairs) -> L
         if row.get("pair_family") == "ambiguous_topology":
             warnings.append(_warning("warn", "ambiguous_topology", location, row.get("pair_subtype", "")))
         elif row.get("is_hoogsteen"):
-            geometry = base_pair_geometry_annotation(row) or row.get("edge_pair") or "Hoogsteen-like"
-            warnings.append(_warning("info", "hoogsteen_pair", location, f"{row['residue_1']} paired with {row['residue_2']} is {geometry}; local shape parameters use contact-geometry frames when reliable contacts are available."))
+            geometry = base_pair_observed_geometry_annotation(row)
+            label = pairing_mode_label(row.get("pairing_mode", ""))
+            suffix = f" {geometry}" if geometry else ""
+            warnings.append(_warning(
+                "info",
+                "hoogsteen_pair",
+                location,
+                f"{row['residue_1']} paired with {row['residue_2']} is classified as {label}{suffix} from current-coordinate evidence.",
+            ))
+        elif (
+            row.get("classification_status") == "possible"
+            and row.get("candidate_mode") == "hoogsteen"
+        ):
+            warnings.append(_warning(
+                "info",
+                "possible_hoogsteen_pair",
+                location,
+                f"{row['residue_1']} paired with {row['residue_2']} has evidence consistent with possible Hoogsteen pairing, but no definitive ordered LW assignment.",
+            ))
+        elif row.get("frame_mode") == "provisional_contact_geometry":
+            candidate = str(row.get("candidate_lw_family") or "").strip()
+            suffix = f"; possible [{candidate}]" if candidate else ""
+            warnings.append(_warning(
+                "info",
+                "unresolved_contact_geometry_pair",
+                location,
+                f"{row['residue_1']} paired with {row['residue_2']} uses a provisional contact frame from {row.get('contact_count', 0)} independent contact(s){suffix}; no LW family is assigned.",
+            ))
         elif row.get("frame_mode") == "contact_geometry":
             geometry = base_pair_geometry_annotation(row) or row.get("edge_pair") or "unknown edges"
             warnings.append(_warning("info", "contact_geometry_pair", location, f"{row['residue_1']} paired with {row['residue_2']} uses {geometry} contact-geometry frames for local shape parameters."))
         elif row.get("is_mismatch"):
             warnings.append(_mismatch_warning(row, location))
             mismatch_reported = True
-        elif row.get("pair_family") == "wobble":
-            warnings.append(_warning("info", "wobble_pair", location, f"{row['residue_1']} paired with {row['residue_2']} is recognized as wobble/noncanonical."))
+        elif row.get("pairing_mode") == "wobble":
+            warnings.append(_warning("info", "wobble_pair", location, f"{row['residue_1']} paired with {row['residue_2']} is classified as wobble from current-coordinate evidence."))
         if row.get("is_mismatch") and not mismatch_reported:
             warnings.append(_mismatch_warning(row, location))
         if row.get("has_modified_base"):
@@ -1186,7 +1854,7 @@ def _collect_warnings(ctx, base_pairs, base_fit_quality, source_base_pairs) -> L
 
 
 def _mismatch_warning(row: Dict[str, Any], location: str) -> Dict[str, str]:
-    geometry = base_pair_geometry_annotation(row)
+    geometry = base_pair_observed_geometry_annotation(row)
     suffix = f" Observed geometry: {geometry}." if geometry else ""
     return _warning(
         "warn",

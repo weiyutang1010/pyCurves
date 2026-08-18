@@ -1,5 +1,4 @@
 import numpy as np
-from scipy.spatial.transform import Rotation
 import math
 from pycurves_lib.data.modified_bases import parent_base_name
 from pycurves_lib.core.curves_groove import GrooveAnalysisMixin
@@ -69,6 +68,22 @@ class HelicalCalculator(CurvesPlusAxisMixin, GrooveAnalysisMixin):
             return p.frames
         return axis_frames
 
+    def _axis_step_weight(self, strand: int, first_level: int, second_level: int) -> float:
+        if not bool(getattr(self.ctx.cfg, "axis_weighting", False)):
+            return 1.0
+        weights = getattr(self.ctx, "axis_support_weights", None)
+        if weights is None:
+            return 1.0
+        return float(min(weights[first_level, strand], weights[second_level, strand]))
+
+    def _axis_pair_weight(self, partner_strand: int, level: int) -> float:
+        if not bool(getattr(self.ctx.cfg, "axis_weighting", False)):
+            return 1.0
+        weights = getattr(self.ctx, "axis_support_weights", None)
+        if weights is None:
+            return 1.0
+        return float(min(weights[level, 0], weights[level, partner_strand]))
+
     def calculate_all(self):
         """Run the regular Curves calculation stages in Fortran call order."""
         self._set_axis_directions()
@@ -91,7 +106,7 @@ class HelicalCalculator(CurvesPlusAxisMixin, GrooveAnalysisMixin):
             for i in range(ist + 1, ien + 1):
                 u_sum = self.optimizer.uho[i, :, k] + self.optimizer.uho[i-1, :, k]
                 h_diff = self.optimizer.hho[i, :, k] - self.optimizer.hho[i-1, :, k]
-                rise_sum += np.sign(np.dot(u_sum, h_diff))
+                rise_sum += self._axis_step_weight(k, i - 1, i) * np.sign(np.dot(u_sum, h_diff))
             
             self.inv[k] = 1
             if (self.ctx.idr[k] == 1 and rise_sum < 0) or (self.ctx.idr[k] == -1 and rise_sum > 0):
@@ -138,7 +153,11 @@ class HelicalCalculator(CurvesPlusAxisMixin, GrooveAnalysisMixin):
             u_sum = self.optimizer.uho[iste+1:iene+1, :, k] + self.optimizer.uho[iste:iene, :, k]
             h_diff = self.optimizer.hho[iste+1:iene+1, :, k] - self.optimizer.hho[iste:iene, :, k]
             dots = np.einsum('ij,ij->i', u_sum, h_diff)
-            rise_sum = np.sum(np.sign(dots))
+            step_weights = np.asarray([
+                self._axis_step_weight(k, level - 1, level)
+                for level in range(iste + 1, iene + 1)
+            ])
+            rise_sum = np.sum(step_weights * np.sign(dots))
             
             self.inv[k] = 1
             if (self.ctx.idr[k] == 1 and rise_sum < 0) or (self.ctx.idr[k] == -1 and rise_sum > 0):
@@ -391,10 +410,11 @@ class HelicalCalculator(CurvesPlusAxisMixin, GrooveAnalysisMixin):
         """Return Section C global base-pair axis values for strand 1 with partner_strand."""
         if self._use_curvesplus_axis_convention() and hasattr(self, "curvesplus_bp_axis") and partner_strand == 1:
             values = self.curvesplus_bp_axis[level]
-            if np.all(np.isfinite(values)):
-                return values.copy()
+            return values.copy() if np.all(np.isfinite(values)) else None
 
         if not (self._has_level(0, level) and self._has_level(partner_strand, level)):
+            return None
+        if self._axis_pair_weight(partner_strand, level) <= 0.0:
             return None
 
         p = self.ctx.params
@@ -418,11 +438,8 @@ class HelicalCalculator(CurvesPlusAxisMixin, GrooveAnalysisMixin):
             and str(getattr(self.ctx.cfg, "axis_convention", "legacy")).lower() == "curvesplus"
         )
 
-    def _global_base_base_values(self, partner_strand: int, level: int):
-        """Return Section D global base-base values for strand 0 with partner_strand."""
-        if self._use_curvesplus_axis_convention() or getattr(self.ctx, "axis_reference_uses_continuity", False):
-            return self._local_base_base_values(partner_strand, level)
-
+    def _instantaneous_global_base_base_values(self, partner_strand: int, level: int):
+        """Return the current-level terms used to build Curves Section D."""
         if not (self._has_level(0, level) and self._has_level(partner_strand, level)):
             return None
 
@@ -448,6 +465,58 @@ class HelicalCalculator(CurvesPlusAxisMixin, GrooveAnalysisMixin):
             buc_val = diff_ang(p.helical[partner_strand, level, 3], p.helical[0, level, 3])
 
         return np.array([shr_val, str_val, stg, buc_val, pro_val, opn], dtype=float)
+
+    def _curves_global_base_base_values_by_level(self, partner_strand: int):
+        """Yield Curves Section D values, including cumulative stagger/opening.
+
+        Curves adds the current helical-coordinate differences before testing
+        whether the preceding pair is missing.  Consequently, the first valid
+        pair after a break is reported with zero stagger and opening, and
+        accumulation resumes at the following pair.
+        """
+        _, _, iste, iene = self._axis_bounds(0)
+        stagger = 0.0
+        opening = 0.0
+
+        for level in range(iste, iene + 1):
+            values = self._instantaneous_global_base_base_values(partner_strand, level)
+            if values is None:
+                continue
+
+            values = values.copy()
+            stagger += values[2]
+            opening += values[5]
+            if level > iste and (
+                not self._has_level(0, level - 1)
+                or not self._has_level(partner_strand, level - 1)
+            ):
+                stagger = 0.0
+                opening = 0.0
+
+            values[2] = stagger
+            values[5] = opening
+            yield level, values
+
+    def _global_base_base_values_by_level(self, partner_strand: int):
+        """Yield the Section D values selected by the active convention."""
+        if self._use_curvesplus_axis_convention() or getattr(
+            self.ctx, "axis_reference_uses_continuity", False
+        ):
+            _, _, iste, iene = self._axis_bounds(0)
+            for level in range(iste, iene + 1):
+                values = self._local_base_base_values(partner_strand, level)
+                if values is not None:
+                    yield level, values
+            return
+
+        yield from self._curves_global_base_base_values_by_level(partner_strand)
+
+    def _global_base_base_values(self, partner_strand: int, level: int):
+        """Return Section D global base-base values for one level."""
+        for current_level, values in self._global_base_base_values_by_level(partner_strand):
+            if current_level == level:
+                return values
+        return None
 
     def _local_base_base_values(self, partner_strand: int, level: int):
         """Return local intra-base-pair values from the two fitted base frames.
@@ -683,38 +752,6 @@ class HelicalCalculator(CurvesPlusAxisMixin, GrooveAnalysisMixin):
         base_2, _, res_id_2 = other
         return f"{base_1}{res_id_1:3d}-{base_2}{res_id_2:3d}"
 
-    def _base_pair_displacement(self, first_strand: int, other_strand: int, level: int):
-        p = self.ctx.params
-        first = p.frames[first_strand, level]
-        other = p.frames[other_strand, level]
-
-        x_axis = first[0] + other[0]
-        x_axis /= np.linalg.norm(x_axis)
-
-        y_axis = first[1] - other[1]
-        y_axis /= np.linalg.norm(y_axis)
-
-        z_axis = np.cross(x_axis, y_axis)
-        z_axis /= np.linalg.norm(z_axis)
-        y_axis = np.cross(z_axis, x_axis)
-
-        delta = first[3] - other[3]
-        return (
-            float(np.dot(x_axis, delta)),
-            float(np.dot(y_axis, delta)),
-            float(np.dot(z_axis, delta)),
-        )
-
-    def _base_pair_opening(self, first_strand: int, other_strand: int, level: int) -> float:
-        first = self.ctx.params.frames[first_strand, level, :3, :]
-        other = self.ctx.params.frames[other_strand, level, :3, :].copy()
-
-        other[1] *= -1.0
-        other[2] *= -1.0
-
-        rotation = Rotation.from_matrix(first @ other.T)
-        return float(-rotation.as_euler("zyx", degrees=True)[0])
-
     @staticmethod
     def _all_finite(values) -> bool:
         return bool(np.all(np.isfinite(np.asarray(values, dtype=float))))
@@ -939,8 +976,6 @@ class HelicalCalculator(CurvesPlusAxisMixin, GrooveAnalysisMixin):
 
                         duplex_id = f"{res_name_1}{res_num_1:3d}-{res_name_k}{res_num_k:3d}"
 
-                        nav += 1
-
                         xdi = (p.helical[0, i, 0] + p.helical[k, i, 0]) / 2.0
                         ydi = (p.helical[0, i, 1] - p.helical[k, i, 1]) / 2.0
                         cln = (p.helical[0, i, 3] + p.helical[k, i, 3]) / 2.0
@@ -951,7 +986,8 @@ class HelicalCalculator(CurvesPlusAxisMixin, GrooveAnalysisMixin):
                         if not self._all_finite([xdi, ydi, cln, tip]):
                             print(f"  {i:3d})      -")
                             continue
-                        
+                        nav += 1
+
                         print(f"  {i:3d}) {duplex_id}  {xdi:8.2f} {ydi:8.2f} {cln:8.2f} {tip:8.2f} "
                               f"{self.bcod[i, 0]:7d} {self.tcod[i, 0]:7d}")
                         
@@ -969,12 +1005,6 @@ class HelicalCalculator(CurvesPlusAxisMixin, GrooveAnalysisMixin):
             print("  |D| Global Base-Base Parameters |")
             print("  ---------------------------------")
             
-            def diff_ang(a, b):
-                """Fortran-compatible implementation."""
-                res = a - b
-                if abs(res) > 180.0:
-                    res -= math.copysign(360.0, res)
-                return res
 
             for k in range(1, nst):
                 print(f"\n  Strand 1 with strand {k+1} ...")
@@ -983,7 +1013,7 @@ class HelicalCalculator(CurvesPlusAxisMixin, GrooveAnalysisMixin):
                 
                 nav = 0
                 hela = np.zeros(6)
-                stg, opn = 0.0, 0.0
+                base_base_by_level = dict(self._curves_global_base_base_values_by_level(k))
 
                 for i in range(self.optimizer.iste, self.optimizer.iene + 1):
                     idx_1 = 0
@@ -999,30 +1029,16 @@ class HelicalCalculator(CurvesPlusAxisMixin, GrooveAnalysisMixin):
                         res_name_k, _, res_num_k = self._residue_label(k, i)
                         duplex_id = f"{res_name_1}{res_num_1:3d}-{res_name_k}{res_num_k:3d}"
 
-                        if i > self.optimizer.iste:
-                            if self.ctx.li[i-1, 0] < -1 or self.ctx.li[i-1, k] < -1:
-                                stg, opn = 0.0, 0.0
-                        
-                        stg += p.helical[0, i, 2] - p.helical[k, i, 2]
-                        opn += p.helical[0, i, 5] - p.helical[k, i, 5]
-
-                        str_val = p.helical[0, i, 1] + p.helical[k, i, 1] # Stretch
-                        pro_val = diff_ang(p.helical[0, i, 4], -p.helical[k, i, 4]) # Propeller
-
-                        if self.ctx.idr[0] >= self.ctx.idr[k]:
-                            shr_val = p.helical[0, i, 0] - p.helical[k, i, 0] # Shear
-                            buc_val = diff_ang(p.helical[0, i, 3], p.helical[k, i, 3]) # Buckle
-                        else:
-                            shr_val = p.helical[k, i, 0] - p.helical[0, i, 0]
-                            buc_val = diff_ang(p.helical[k, i, 3], p.helical[0, i, 3])
-
-                        if not self._all_finite([shr_val, str_val, stg, buc_val, pro_val, opn]):
+                        values = base_base_by_level.get(i)
+                        if values is None or not self._all_finite(values):
                             print(f"  {i:3d})      -")
                             continue
 
+                        shr_val, str_val, stg, buc_val, pro_val, opn = values
+
                         nav += 1
 
-                        hela += [shr_val, str_val, stg, buc_val, pro_val, opn]
+                        hela += values
                         
                         print(f"  {i:3d}) {duplex_id} {shr_val:8.2f} {str_val:8.2f} {stg:8.2f} "
                               f"{buc_val:8.2f} {pro_val:8.2f} {opn:8.2f} {self.bcod[i, 0]:5d} {self.tcod[i, 0]:5d}")
@@ -1078,8 +1094,6 @@ class HelicalCalculator(CurvesPlusAxisMixin, GrooveAnalysisMixin):
                     if (self._has_level(0, i - 1) and self._has_level(0, i) and
                             self._has_level(k, i - 1) and self._has_level(k, i)):
                         step_id = self._step_label(0, i)
-                        nav += 1
-
                         xs = (p.helical[0, i, 0] + p.helical[k, i, 0]) / 2.0
                         xm = (p.helical[0, i - 1, 0] + p.helical[k, i - 1, 0]) / 2.0
                         ys = (p.helical[0, i, 1] - p.helical[k, i, 1]) / 2.0
@@ -1106,6 +1120,7 @@ class HelicalCalculator(CurvesPlusAxisMixin, GrooveAnalysisMixin):
                         if not self._all_finite(vals):
                             print(f"  {i:3d})      -")
                             continue
+                        nav += 1
                         hela += vals
 
                         print(f"  {i:3d}) {step_id:11s} {shif:8.2f} {slid:8.2f} {rise:8.2f} "

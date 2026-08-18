@@ -638,6 +638,8 @@ class MolecularStructure:
     connectivity: np.ndarray = None   # matd (kam, 7) [cite: 1, 89]
     subunit_boundaries: np.ndarray = None # ncen [cite: 1, 89]
     source_base_pairs: list = None
+    source_bonds: list = None
+    connectivity_sources: dict = None
     crystal_cell: tuple = None
     spacegroup_hm: str = ""
 
@@ -719,6 +721,7 @@ class HelicalConfig:
     axonly: bool = False  # Axis-only calculation.
     frame_convention: str = "standard"  # Base reference-frame convention: standard or legacy.
     axis_convention: str = "legacy"  # Global axis convention: legacy optimizer or curvesplus axis/smooth.
+    axis_weighting: bool = False  # Opt in to downweighting geometrically unsupported axis pairs.
 
     # Fortran hel(0,*,*) and hel(nux+1,*,*) terminal rows used when ends=.t.
     # Columns are Xdisp, Ydisp, Rise, Inclination, Tip, Twist.
@@ -775,11 +778,7 @@ class CurvesContext:
         self.ng = cfg.get('ng', np.zeros(self.nst, dtype=int))
         self.nr = cfg.get('nr', np.zeros(self.nst, dtype=int))
         self.ni_map = np.array(cfg['ni_map'])   # Fortran ni: subunit index per strand/level.
-        self.hoogsteen_markers = set(cfg.get('hoogsteen_markers', set()) or set())
         self.pair_geometry_markers = dict(cfg.get('pair_geometry_markers', {}) or {})
-        self.glycosidic_conformation_markers = dict(
-            cfg.get('glycosidic_conformation_markers', {}) or {}
-        )
         self.active_start_levels = self.ng  # Readable alias for Fortran ng.
         self.active_end_levels = self.nr  # Readable alias for Fortran nr.
         self.subunit_map = self.ni_map  # Readable alias for Fortran ni.
@@ -792,15 +791,14 @@ class CurvesContext:
         self._initialize_li_status()
         self.level_status = self.li
 
-        
+
         self.molecule = MolecularStructure()
         self.backbone = BackboneTopology(
-            # 999.0 is the Curves sentinel for missing torsion/angle values.
-            torsions = np.full((self.n_strands, n3, 13), 999.0),
-            
-            angles = np.full((self.n_strands, n3, 2), 999.0),
-            
-            sugar_pucker = np.full((self.n_strands, n3, 2), 999.0),
+            torsions = np.full((self.n_strands, n3, 13), np.nan),
+
+            angles = np.full((self.n_strands, n3, 2), np.nan),
+
+            sugar_pucker = np.full((self.n_strands, n3, 2), np.nan),
             
             # Atom indices are Python 0-based; -1 means "not found".
             atom_map = np.full((self.n_strands, n3, 15), -1, dtype=int),

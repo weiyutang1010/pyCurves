@@ -24,7 +24,7 @@ pip install .
 
 That is enough for static PDB/mmCIF analysis and `.inp` generation.
 
-For trajectory readers, plotting, the experimental batch MD path, and legacy
+For trajectory readers, plotting, the batch MD path, and legacy
 compatibility helpers, install the single full optional set:
 
 ```bash
@@ -105,7 +105,7 @@ available when those workflows are needed.
   `[tWH]`, and `[tSS]`.
 - Text, JSON, and CSV outputs for local/global helical parameters, grooves,
   backbone torsions, curvature, and annotations.
-- MD trajectory analysis and an experimental vectorized Curves+ batch path.
+- MD trajectory analysis and a vectorized Curves+ batch path.
 - Optional HTML viewer payload generation.
 
 ## Important CLI Options
@@ -125,6 +125,9 @@ Common options:
   frames by default, or choose legacy Curves 5.3-compatible frames.
 - `--axis-convention legacy|curvesplus`: choose the legacy pyCurves/JAX axis or
   the Curves+ smooth-axis path.
+- `--axis-weighting` / `--no-axis-weighting`: opt in to smoothly downweighting
+  requested pairs whose fitted Curves base origins separate by 4--8 A during
+  axis construction. The default is the historical unweighted axis.
 - `--generate-inp-only` / `--inp-only`: infer `.inp` files and exit before
   fitting, minimization, or parameter calculation.
 - `--continuous-strands`: treat connected split-chain helices as one biological
@@ -132,7 +135,6 @@ Common options:
 - `--fit`, `--grooves`, `--mini`, `--comb`, and `--ends`: override inferred
   analysis flags. Each also accepts the `--no-*` form. When neither mini option
   is given, the `mini` value in the `.inp` file is used.
-- `--no-annotations`: suppress the pyCurves annotation report.
 - `--visualization`: include geometry needed by `pycurves-viewer` in JSON.
 
 In legacy-axis mode, `mini=.f.` or `--no-mini` constructs the axis once from
@@ -141,21 +143,28 @@ without BFGS minimization.
 
 ## Non-Canonical Pairing
 
-pyCurves detects base-pair identity, interacting edges, and cis/trans orientation
-so that the right local frames and strand-direction signs can be used in shape
-calculations. Canonical Watson-Crick pairs keep the selected canonical frame
-convention; by default this is the Curves+/3DNA-compatible standard frame.
-Non-canonical pairs use contact-geometry frames only when the observed
-edge/contact evidence is strong enough.
+pyCurves reports base-pair identity, interacting edges, and cis/trans
+orientation separately from the geometry used for shape calculations. Canonical
+Watson-Crick pairs keep the selected canonical frame convention; by default this
+is the Curves+/3DNA-compatible standard frame. Explicit `.inp` LW tags and
+authoritative reference annotations may select non-canonical calculation
+frames, but a coordinate-only observation never changes a calculated parameter.
 
 Generated `.inp` files can carry editable geometry tags such as `[cWW]`,
 `[tWW]`, `[cWH]`, `[tWH]`, `[cWS]`, or `[tSS]`. Mismatches are still reported as
-mismatches even when they have a clear edge-contact geometry.
+mismatches even when they have a clear edge-contact geometry. Pair geometry in
+`.inp` files is represented exclusively by explicit three-character LW tags.
 
-The annotation report and JSON/CSV tables include the detected pair class,
-observed edge/orientation tag, source mmCIF pair records when available, and
-warnings for source pairs that do not belong to the current generated `.inp`
-topology.
+The annotation report is part of the Curves text output, and annotation records
+are always included in JSON/CSV results. Pair presence is `present`, `absent`,
+or `uncertain`. `pairing_mode` uses controlled values: `watson_crick`,
+`reverse_watson_crick`, `hoogsteen`, `reverse_hoogsteen`, `wobble`, or
+`other_noncanonical`. A confident `tWW` observation is named
+`reverse_watson_crick`. Uncertain calls
+do not enter that field: for example, Section M renders
+`candidate_mode=hoogsteen` with `classification_status=possible` as “possible
+Hoogsteen.” Records keep `observed_lw_family` separate from
+`reference_lw_family`, and retain diagnostic flags.
 
 ## MD Trajectories
 
@@ -171,6 +180,66 @@ Run trajectory summaries:
 pycurves-md topology.pdb trajectory.xtc --mode summary --frames 1000:5000:10 --output-file dynamics.json
 ```
 
+To annotate transient pairing independently in every analyzed frame, use:
+
+```bash
+pycurves-md topology.pdb trajectory.xtc --topology-mode annotate --mode both --output-file pairing_dynamics.json
+```
+
+`--topology-mode reference` is the default and keeps the reference pair map.
+`annotate` reruns coordinate-only pair detection after parameter calculation,
+reports missing reference pairs as absent, and adds newly detected pairs with
+`reference_pair=false`. The authoritative `base_pair_observations` table
+contains pair presence, observed/reference LW family, named pairing mode,
+classification status, and diagnostic flags in the
+`pycurves-trajectory-slim-v2` schema. Calculation-frame, contact, and
+glycosidic details remain internal rather than being repeated per pair. In
+JSON, `frame` and `time` belong to the containing frame object; flattened CSV
+rows include them as columns.
+
+Axis weighting is independent of topology annotation: it never changes the
+requested residue map or assigns a pairing family. It affects both legacy
+global-axis optimization and Curves+ local smoothing; local base, base-pair,
+step, and backbone parameters remain calculated from the fixed input topology.
+Axis-dependent rows report `axis_weight`, and geometrically unsupported
+base-pair-axis values are null.
+
+Each per-frame `base_pair_observations` row contains exactly these keys:
+
+| Key | What users should expect |
+| --- | --- |
+| `pair_id` | Stable pair identifier made from the two sorted molecular subunit IDs, for example `2:129`. |
+| `reference_pair` | `true` for a pair from the reference map; `false` for a pair newly detected in this frame. |
+| `level` | Curves reference level, or `null` for a newly detected pair that has no reference level. |
+| `residue_1`, `residue_2` | Human-readable chain, residue name, and residue number, for example `B:DT2`. |
+| `pair_status` | `present`, `absent`, or `uncertain` from current-frame coordinate evidence. |
+| `pairing_mode` | Definitive named mode: `watson_crick`, `reverse_watson_crick`, `hoogsteen`, `reverse_hoogsteen`, `wobble`, or `other_noncanonical`; otherwise an empty string. |
+| `observed_lw_family` | Confident current-frame LW family such as `cWW`, `tWW`, `cHW`, or `tWH`; otherwise an empty string. |
+| `reference_lw_family` | LW family supplied by the reference/input topology; may be populated when `observed_lw_family` is empty. |
+| `candidate_mode` | Tentative named mode when the evidence supports a possibility but not a definitive assignment; otherwise an empty string. |
+| `classification_status` | `assigned`, `possible`, `unassigned`, or `conflict`. |
+| `diagnostic_flags` | Machine-readable reasons requiring review; normally an empty list. |
+
+Empty `pairing_mode` and `observed_lw_family` values mean **unclassified**, not
+noncanonical. For example, `pair_status="present"`,
+`reference_lw_family="cWW"`, and `observed_lw_family=""` means that the
+reference pair is present but the current coordinates did not support a
+definitive observed LW assignment.
+
+The separate `annotations` table does not repeat base-pair rows. A
+`modified_base` row contains `annotation_type`, `severity`, `level`,
+`location`, `code`, `message`, `residue`, and `parent_base`. A `backbone_link`
+row contains `annotation_type`, `severity`, `level`, `location`, `code`,
+`message`, `source_subunit`, `target_subunit`, `bond_source`, and `distance`.
+The table is empty when neither event type occurs.
+
+In `summary` mode `base_pair_observations` becomes a categorical state profile:
+each row reports one pair/status/mode/LW combination with `frame_count` and
+`frame_fraction`. Identifiers and diagnostic fields are not numerically
+averaged. The separate `annotations` table is reserved for modified-base and
+backbone-connectivity events. This mode is currently implemented only in
+`pycurves-md`, not `pycurves-md-batch`.
+
 Summary tables report numeric columns as `*_mean` and `*_stddev`. Angular columns
 use a circular mean and the resultant-length standard deviation
 `sqrt(-2 log(R))`, where `R` is the mean resultant length, reported in degrees.
@@ -181,7 +250,7 @@ Store both per-frame rows and summary statistics:
 pycurves-md topology.pdb trajectory.dcd --mode both --format json --output-file dynamics_full.json
 ```
 
-For canonical two-strand Curves+/standard-frame trajectories, the experimental
+For canonical two-strand Curves+/standard-frame trajectories, the vectorized
 batch path can be much faster:
 
 ```bash
@@ -323,10 +392,17 @@ inp_files = runner.generate_inp(prefix="1QNB_auto")
 
 ## Output
 
-JSON output uses the `pycurves-slim-v1` schema. It contains metadata plus flat
+JSON output uses the `pycurves-slim-v2` schema. It contains metadata plus flat
 `dataframes` records for local/global parameters, backbone, groove, curvature,
 and annotations. Gapped or uncomputed backbone positions are kept with `null`
 values so sequence-indexed tables stay aligned; each row also reports `valid`,
 `status`, `warnings`, and `missing_parameters`. Residue names and chain IDs are
 stored separately. CSV output writes one file per dataframe using the
 `--output-file` value as the prefix.
+
+## Code Guides
+
+For a file-by-file map of the top-level commands, see
+[`SCRIPT_REFERENCE.md`](SCRIPT_REFERENCE.md). Each Python package directory has
+the same two-level documentation pattern: a short `README.md` and a detailed
+`SCRIPT_REFERENCE.md`.

@@ -6,10 +6,16 @@ import networkx as nx
 import numpy as np
 
 from pycurves_lib.core.curves_dataclasses import MolecularStructure
-from pycurves_lib.topology.base_annotations import (
-    BASE_EDGE_ATOMS,
-    EDGE_ORDER,
-    infer_glycosidic_conformation,
+from pycurves_lib.io.base_reference import (
+    BaseFrameFitter,
+    BaseReferenceLibrary,
+    is_fitted_cww_pose,
+    relative_base_frame_geometry,
+)
+from pycurves_lib.topology.base_annotations import BASE_EDGE_ATOMS, EDGE_ORDER
+from pycurves_lib.topology.lw_exemplars import (
+    LWClassification,
+    get_lw_exemplar_library,
 )
 from pycurves_lib.data.modified_bases import parent_base_name
 
@@ -24,13 +30,33 @@ BASE_ATOMS = {
     "U": {"N1", "C2", "O2", "N3", "C4", "O4", "C5", "C6"},
 }
 HBOND_ATOMS = {
-    "A": {"N1", "N6", "N7", "N3", "C2", "C8"},
-    "G": {"N1", "N2", "O6", "N7", "N3", "C2", "C8"},
-    "C": {"N3", "N4", "O2", "C5", "C6"},
-    "T": {"N3", "O4", "O2", "C5", "C6", "C7"},
-    "U": {"N3", "O4", "O2", "C5", "C6"},
-    "I": {"N1", "O6", "N7", "N3", "C2", "C8"},
+    "A": {"N1", "N6", "N7", "N3", "C2", "C8", "O2'", "O2*"},
+    "G": {"N1", "N2", "O6", "N7", "N3", "C2", "C8", "O2'", "O2*"},
+    "C": {"N3", "N4", "O2", "C5", "C6", "O2'", "O2*"},
+    "T": {"N3", "O4", "O2", "C5", "C6", "C7", "O2'", "O2*"},
+    "U": {"N3", "O4", "O2", "C5", "C6", "O2'", "O2*"},
+    "I": {"N1", "O6", "N7", "N3", "C2", "C8", "O2'", "O2*"},
 }
+BASE_HBOND_DONORS = {
+    "A": {"N6"},
+    "G": {"N1", "N2"},
+    "I": {"N1"},
+    "C": {"N4"},
+    "T": {"N3"},
+    "U": {"N3"},
+}
+BASE_HBOND_ACCEPTORS = {
+    "A": {"N1", "N3", "N7"},
+    "G": {"O6", "N3", "N7"},
+    "I": {"O6", "N3", "N7"},
+    "C": {"O2", "N3"},
+    "T": {"O2", "O4"},
+    "U": {"O2", "O4"},
+}
+for _base in tuple(BASE_HBOND_DONORS):
+    # Ribose O2' may act as either donor or acceptor in sugar-edge pairs.
+    BASE_HBOND_DONORS[_base].update({"O2'", "O2*"})
+    BASE_HBOND_ACCEPTORS[_base].update({"O2'", "O2*"})
 GLYCOSIDIC_ATOMS = {
     "A": "N9",
     "G": "N9",
@@ -48,6 +74,9 @@ HBOND_DISTANCE_CUTOFF = 3.8
 HBOND_PREFILTER_DISTANCE = 11.0
 BASE_PAIR_PLANE_OFFSET_CUTOFF = 3.2
 PAIR_GEOMETRY_PLANE_OFFSET_CUTOFF = 2.0
+FITTED_PAIR_ORIGIN_DISTANCE_CUTOFF = 15.0
+FITTED_PAIR_VERTICAL_SEPARATION_CUTOFF = 2.5
+FITTED_PAIR_NORMAL_ANGLE_CUTOFF = 65.0
 GLYCOSIDIC_SIDE_EPSILON = 0.25
 SUSPICIOUS_BACKBONE_GAP_DISTANCE = 8.5
 REGISTER_GAP_CENTER_CUTOFF = 7.8
@@ -97,6 +126,7 @@ class ResidueNode:
     center: np.ndarray
     sugar_center: np.ndarray
     hbond_center: np.ndarray
+    fitted_geometry: Optional[Dict[str, object]] = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +141,9 @@ class BasePairCandidate:
     pair_family: str
     atom_pairs: Tuple[Tuple[str, str, float], ...]
     is_hoogsteen: bool = False
+    fitted_geometry: Optional[Dict[str, object]] = None
+    lw_classification: Optional[LWClassification] = None
+    strong_contact_support: Optional[bool] = None
 
 
 @dataclass
@@ -126,9 +159,7 @@ class InferredTopology:
     fit: bool = True
     grv: bool = True
     ends: bool = False
-    hoogsteen_markers: set = field(default_factory=set)
     pair_geometry_markers: Dict[Tuple[int, int], str] = field(default_factory=dict)
-    glycosidic_conformation_markers: Dict[Tuple[int, int], str] = field(default_factory=dict)
 
     @property
     def n_strands(self) -> int:
@@ -156,20 +187,9 @@ class InferredTopology:
             tokens = []
             for level, value in enumerate(row, start=1):
                 token = str(int(value))
-                tags = []
                 geometry_tag = self.pair_geometry_markers.get((strand, level)) if int(value) != 0 else None
                 if geometry_tag:
-                    tags.append(geometry_tag)
-                elif int(value) != 0 and (
-                    (strand, level) in self.hoogsteen_markers
-                    or level in self.hoogsteen_markers
-                ):
-                    tags.append("Hoog")
-                conformation = self.glycosidic_conformation_markers.get((strand, level))
-                if int(value) != 0 and conformation == "syn":
-                    tags.append("syn")
-                if tags:
-                    token += "".join(f"[{tag}]" for tag in tags)
+                    token += f"[{geometry_tag}]"
                 tokens.append(token)
             lines.append(" " + " ".join(tokens))
         lines.append("0.0 0.0 0.0 0.0")
@@ -191,6 +211,9 @@ class RobustTopologyInferrer:
         self.mol = mol
         self.pdbfile = pdbfile or ""
         self.residues: Dict[int, ResidueNode] = {}
+        self.reference_library = BaseReferenceLibrary.load("standard")
+        self.frame_fitter = BaseFrameFitter(self.reference_library)
+        self.lw_exemplar_library = get_lw_exemplar_library()
         self.strands: List[List[int]] = []
         self.complexes: List[List[int]] = []
         self.pair_edges: List[Tuple[int, int]] = []
@@ -292,6 +315,16 @@ class RobustTopologyInferrer:
                 hbond_indices = base_indices
             hbond_center = np.mean(self.mol.coordinates[hbond_indices], axis=0)
 
+            residue_atoms: Dict[str, int] = {}
+            for offset, atom_name in enumerate(atom_names):
+                residue_atoms.setdefault(atom_name, start + offset)
+            template = self.reference_library.template_for_base(base)
+            fitted_geometry = (
+                self.frame_fitter.fit(template, residue_atoms, self.mol.coordinates)
+                if template is not None
+                else None
+            )
+
             chain = ""
             if self.mol.chain_ids is not None:
                 chain = str(self.mol.chain_ids[start]).strip()
@@ -306,7 +339,36 @@ class RobustTopologyInferrer:
                 center=center,
                 sugar_center=sugar_center,
                 hbond_center=hbond_center,
+                fitted_geometry=fitted_geometry,
             )
+
+    def _fitted_pair_geometry(
+        self,
+        residue_1: ResidueNode,
+        residue_2: ResidueNode,
+    ) -> Optional[Dict[str, object]]:
+        """Describe a pair in standard fitted base frames."""
+        if residue_1.fitted_geometry is None or residue_2.fitted_geometry is None:
+            return None
+        return relative_base_frame_geometry(
+            residue_1.fitted_geometry,
+            residue_2.fitted_geometry,
+            origin_distance_cutoff=FITTED_PAIR_ORIGIN_DISTANCE_CUTOFF,
+            vertical_separation_cutoff=FITTED_PAIR_VERTICAL_SEPARATION_CUTOFF,
+            normal_angle_cutoff=FITTED_PAIR_NORMAL_ANGLE_CUTOFF,
+        )
+
+    def _lw_classification(
+        self,
+        residue_1: ResidueNode,
+        residue_2: ResidueNode,
+    ) -> Optional[LWClassification]:
+        return self.lw_exemplar_library.classify_fits(
+            residue_1.base,
+            residue_1.fitted_geometry,
+            residue_2.base,
+            residue_2.fitted_geometry,
+        )
 
     def _trace_strands(self) -> None:
         ordered = sorted(self.residues.values(), key=lambda r: r.subunit)
@@ -363,6 +425,63 @@ class RobustTopologyInferrer:
             if atom_name in wanted:
                 return self.mol.coordinates[atom_idx]
         return None
+
+    def coordinate_pair_candidates(
+        self,
+        *,
+        one_to_one: bool = True,
+        provisional_pairs: Optional[Iterable[Tuple[int, int]]] = None,
+    ) -> List[BasePairCandidate]:
+        """Detect current-coordinate pairs without source-table assistance."""
+        self._collect_residues()
+        self._trace_strands()
+        provisional_pair_keys = {
+            tuple(sorted((int(first), int(second))))
+            for first, second in (provisional_pairs or ())
+        }
+        grouped: Dict[Tuple[int, int], List[BasePairCandidate]] = {}
+        for i, first_strand in enumerate(self.strands):
+            for j in range(i + 1, len(self.strands)):
+                second_strand = self.strands[j]
+                candidates = []
+                for first in first_strand:
+                    for second in second_strand:
+                        residue_1 = self.residues[first]
+                        residue_2 = self.residues[second]
+                        if (
+                            np.linalg.norm(
+                                residue_1.hbond_center - residue_2.hbond_center
+                            )
+                            > HBOND_PREFILTER_DISTANCE
+                        ):
+                            continue
+                        candidate = self._score_base_pair(
+                            first,
+                            second,
+                            i,
+                            j,
+                            donor_acceptor_only=True,
+                            allow_single_contact=(
+                                tuple(sorted((first, second)))
+                                in provisional_pair_keys
+                            ),
+                        )
+                        if candidate is not None:
+                            candidates.append(candidate)
+                if candidates:
+                    grouped[(i, j)] = candidates
+
+        if not one_to_one:
+            return [
+                candidate
+                for candidates in grouped.values()
+                for candidate in candidates
+            ]
+        return [
+            candidate
+            for candidates in grouped.values()
+            for candidate in self._select_one_to_one_pairs(candidates)
+        ]
 
     def _find_base_pair_candidates(self) -> List[BasePairCandidate]:
         """Return one-to-one H-bonded base pairs for each strand pair."""
@@ -431,6 +550,8 @@ class RobustTopologyInferrer:
                     seen.add(key)
                     residue_1 = self.residues[left]
                     residue_2 = self.residues[right]
+                    fitted_geometry = self._fitted_pair_geometry(residue_1, residue_2)
+                    lw_classification = self._lw_classification(residue_1, residue_2)
                     center_distance = float(np.linalg.norm(residue_1.center - residue_2.center))
                     score = self._base_pair_candidate_score(
                         "source_annotated",
@@ -449,6 +570,8 @@ class RobustTopologyInferrer:
                         pair_family="source_annotated",
                         atom_pairs=(),
                         is_hoogsteen=bool(row.get("is_hoogsteen")),
+                        fitted_geometry=fitted_geometry,
+                        lw_classification=lw_classification,
                     ))
         return candidates
 
@@ -458,26 +581,72 @@ class RobustTopologyInferrer:
         second: int,
         first_strand: int,
         second_strand: int,
+        *,
+        donor_acceptor_only: bool = False,
+        allow_single_contact: bool = False,
     ) -> Optional[BasePairCandidate]:
         residue_1 = self.residues[first]
         residue_2 = self.residues[second]
+        fitted_geometry = self._fitted_pair_geometry(residue_1, residue_2)
+        lw_classification = self._lw_classification(residue_1, residue_2)
+        confident_lw = bool(lw_classification and lw_classification.confident)
         atom_map_1 = self._atom_map(residue_1)
         atom_map_2 = self._atom_map(residue_2)
 
         pattern_matches, pattern_family = self._pattern_hbond_matches(residue_1.base, residue_2.base, atom_map_1, atom_map_2)
-        generic_matches = self._generic_hbond_matches(residue_1, residue_2, atom_map_1, atom_map_2)
-
+        generic_matches = self._generic_hbond_matches(
+            residue_1, residue_2, atom_map_1, atom_map_2,
+            donor_acceptor_only=donor_acceptor_only,
+        )
         if len(pattern_matches) >= 2:
             pair_family = pattern_family
             matches = pattern_matches
         elif len(generic_matches) >= 2:
             pair_family = "hbonded_noncanonical"
             matches = generic_matches
+        elif confident_lw and generic_matches:
+            # Sugar-edge and other valid LW families may have only one
+            # recoverable heavy-atom contact in an experimental model.
+            pair_family = "lw_exemplar"
+            matches = generic_matches
+        elif (
+            allow_single_contact
+            and generic_matches
+            and fitted_geometry is not None
+            and bool(fitted_geometry.get("eligible"))
+        ):
+            # A reference pair that already uses family-neutral contact
+            # geometry remains observable while its one donor-acceptor contact
+            # survives. Do not enable this relaxation for novel pairs.
+            pair_family = "provisional_contact"
+            matches = generic_matches
         else:
             return None
 
+        # The fitted-pair eligibility envelope is a topology safeguard, not a
+        # physical upper bound on buckle.  An extreme but chemically supported
+        # pair can exceed its normal-angle cutoff while retaining multiple
+        # short, independent donor-acceptor contacts (1R2L level 11 is the
+        # motivating example).  Evaluate those contacts before rejecting the
+        # pair so a large deformation does not erase its LW geometry.
+        strong_contact_support: Optional[bool] = None
+        if (
+            fitted_geometry is not None
+            and not bool(fitted_geometry["eligible"])
+            and not confident_lw
+        ):
+            strong_contact_support = self._has_strong_coordinate_pair_support(
+                residue_1,
+                residue_2,
+                atom_map_1,
+                atom_map_2,
+                pattern_matches=pattern_matches,
+            )
+            if not strong_contact_support:
+                return None
+
         center_distance = float(np.linalg.norm(residue_1.center - residue_2.center))
-        if center_distance > 9.0:
+        if center_distance > 9.0 and not confident_lw:
             return None
         plane_offset = self._base_pair_plane_offset(residue_1, residue_2)
         if (
@@ -503,6 +672,52 @@ class RobustTopologyInferrer:
             pair_family=pair_family,
             atom_pairs=tuple(matches),
             is_hoogsteen=pair_family == "hoogsteen_like",
+            fitted_geometry=fitted_geometry,
+            lw_classification=lw_classification,
+            strong_contact_support=strong_contact_support,
+        )
+
+    def _has_strong_coordinate_pair_support(
+        self,
+        residue_1: ResidueNode,
+        residue_2: ResidueNode,
+        atom_map_1: Optional[Dict[str, np.ndarray]] = None,
+        atom_map_2: Optional[Dict[str, np.ndarray]] = None,
+        *,
+        pattern_matches: Optional[Sequence[Tuple[str, str, float]]] = None,
+    ) -> bool:
+        """Return whether contacts override only the fitted normal-angle gate.
+
+        Two independent donor-acceptor contacts plus ordinary pair-center and
+        plane-offset bounds are strong evidence of a real pair even when the
+        bases are more buckled than the fitted-frame eligibility envelope.
+        """
+        atom_map_1 = atom_map_1 or self._atom_map(residue_1)
+        atom_map_2 = atom_map_2 or self._atom_map(residue_2)
+        if pattern_matches is None:
+            pattern_matches, _ = self._pattern_hbond_matches(
+                residue_1.base,
+                residue_2.base,
+                atom_map_1,
+                atom_map_2,
+            )
+        donor_acceptor_matches = self._generic_hbond_matches(
+            residue_1,
+            residue_2,
+            atom_map_1,
+            atom_map_2,
+            donor_acceptor_only=True,
+        )
+        if max(len(pattern_matches), len(donor_acceptor_matches)) < 2:
+            return False
+
+        center_distance = float(np.linalg.norm(residue_1.center - residue_2.center))
+        if center_distance > 9.0:
+            return False
+        plane_offset = self._base_pair_plane_offset(residue_1, residue_2)
+        return bool(
+            plane_offset is not None
+            and plane_offset <= BASE_PAIR_PLANE_OFFSET_CUTOFF
         )
 
     @staticmethod
@@ -524,6 +739,8 @@ class RobustTopologyInferrer:
             "source_annotated": -200.0,
             "watson_crick_or_wobble": -120.0,
             "hoogsteen_like": -90.0,
+            "lw_exemplar": -80.0,
+            "provisional_contact": -70.0,
             "hbonded_noncanonical": -50.0,
         }.get(pair_family, -20.0)
         return family_priority - 2.0 * hbond_count + mean_distance + 0.05 * center_distance
@@ -591,14 +808,27 @@ class RobustTopologyInferrer:
         residue_2: ResidueNode,
         atom_map_1: Dict[str, np.ndarray],
         atom_map_2: Dict[str, np.ndarray],
+        *,
+        donor_acceptor_only: bool = False,
     ) -> List[Tuple[str, str, float]]:
         close_contacts = []
+        donors_1 = BASE_HBOND_DONORS.get(residue_1.base, set())
+        acceptors_1 = BASE_HBOND_ACCEPTORS.get(residue_1.base, set())
+        donors_2 = BASE_HBOND_DONORS.get(residue_2.base, set())
+        acceptors_2 = BASE_HBOND_ACCEPTORS.get(residue_2.base, set())
         for atom_1 in HBOND_ATOMS.get(residue_1.base, set()):
             if atom_1 not in atom_map_1:
                 continue
             for atom_2 in HBOND_ATOMS.get(residue_2.base, set()):
                 if atom_2 not in atom_map_2:
                     continue
+                if donor_acceptor_only:
+                    compatible = (
+                        (atom_1 in donors_1 and atom_2 in acceptors_2)
+                        or (atom_1 in acceptors_1 and atom_2 in donors_2)
+                    )
+                    if not compatible:
+                        continue
                 distance = float(np.linalg.norm(atom_map_1[atom_1] - atom_map_2[atom_2]))
                 if distance <= HBOND_DISTANCE_CUTOFF:
                     close_contacts.append((atom_1, atom_2, distance))
@@ -727,10 +957,11 @@ class RobustTopologyInferrer:
         ]
         anchors.sort(key=lambda item: primary_position[item[0]])
 
-        partner_positions = [partner_position[partner_subunit] for _, partner_subunit, _ in anchors]
-        partner_direction = -1
-        if len(partner_positions) >= 2:
-            partner_direction = 1 if partner_positions[-1] > partner_positions[0] else -1
+        partner_direction = self._select_partner_direction(
+            anchors,
+            primary_position,
+            partner_position,
+        )
 
         anchors = self._drop_isolated_register_outliers(
             anchors,
@@ -760,6 +991,23 @@ class RobustTopologyInferrer:
         )
         self._collapse_opposing_internal_gap_pairs(row_1, row_2)
 
+        # Sparse contact anchors may interleave partner-only levels with holes
+        # in the primary strand. Such a map cannot define one continuous axis.
+        if not self._primary_level_path_is_contiguous(row_1, primary_strand):
+            partner_by_primary = {
+                primary: partner
+                for primary, partner in zip(row_1, row_2)
+                if primary > 0
+            }
+            mapped_primary = [subunit for subunit in row_1 if subunit > 0]
+            if mapped_primary:
+                start = primary_position[mapped_primary[0]]
+                stop = primary_position[mapped_primary[-1]] + 1
+                row_1 = list(primary_strand[start:stop])
+            else:
+                row_1 = list(primary_strand)
+            row_2 = [partner_by_primary.get(subunit, 0) for subunit in row_1]
+
         paired_count = sum(1 for left, right in zip(row_1, row_2) if left > 0 and right > 0)
         # Curves uses the signed magnitude to determine how many aligned
         # mapping columns to read. Internal zero/gap entries still occupy a
@@ -778,9 +1026,7 @@ class RobustTopologyInferrer:
             if subunit > 0:
                 level_by_subunit[subunit] = level
                 strand_by_subunit[subunit] = 2
-        hoogsteen_markers = set()
         pair_geometry_markers = {}
-        glycosidic_conformation_markers = self._glycosidic_markers_for_map(ni_map)
         for candidate in selected_pairs:
             if candidate.first not in level_by_subunit or candidate.second not in level_by_subunit:
                 continue
@@ -795,12 +1041,27 @@ class RobustTopologyInferrer:
             if geometry_marker is not None:
                 strand_id, level, tag = geometry_marker
                 pair_geometry_markers[(strand_id, level)] = tag
+
+        # Register interpolation may retain a plausible paired level that was
+        # not itself selected as an anchor.  An untagged noncomplementary pair
+        # would otherwise acquire implicit cWW calculation semantics.  Keep
+        # the family explicitly unresolved unless coordinate evidence above
+        # was strong enough to produce a named marker.
+        for level, (subunit_1, subunit_2) in enumerate(
+            zip(row_1, row_2),
+            start=1,
+        ):
+            if subunit_1 <= 0 or subunit_2 <= 0:
                 continue
-            if candidate.is_hoogsteen:
-                marker_subunit = self._hoogsteen_marker_subunit(candidate)
-                if marker_subunit not in level_by_subunit:
-                    continue
-                hoogsteen_markers.add((strand_by_subunit[marker_subunit], level_by_subunit[marker_subunit]))
+            if any(
+                (strand_id, level) in pair_geometry_markers
+                for strand_id in (1, 2)
+            ):
+                continue
+            residue_1 = self.residues[subunit_1]
+            residue_2 = self.residues[subunit_2]
+            if not self._is_complementary(residue_1.base, residue_2.base):
+                pair_geometry_markers[(1, level)] = "unresolved"
 
         return InferredTopology(
             pdbfile=self.pdbfile,
@@ -813,21 +1074,63 @@ class RobustTopologyInferrer:
             comb=True,
             fit=True,
             grv=paired_count >= 4,
-            hoogsteen_markers=hoogsteen_markers,
             pair_geometry_markers=pair_geometry_markers,
-            glycosidic_conformation_markers=glycosidic_conformation_markers,
         )
 
-    def _hoogsteen_marker_subunit(self, candidate: BasePairCandidate) -> int:
-        """Return the base that uses the Hoogsteen edge in a marked pair."""
-        purines = {"A", "G", "I"}
-        first_is_purine = self.residues[candidate.first].base in purines
-        second_is_purine = self.residues[candidate.second].base in purines
-        if first_is_purine and not second_is_purine:
-            return candidate.first
-        if second_is_purine and not first_is_purine:
-            return candidate.second
-        return candidate.first
+    @staticmethod
+    def _primary_level_path_is_contiguous(
+        row: Sequence[int],
+        primary_strand: Sequence[int],
+    ) -> bool:
+        """Return whether every inferred level follows one primary backbone."""
+        mapped = [subunit for subunit in row if subunit > 0]
+        if not mapped:
+            return False
+        start = primary_strand.index(mapped[0])
+        stop = primary_strand.index(mapped[-1]) + 1
+        return mapped == list(primary_strand[start:stop]) and len(mapped) == len(row)
+
+    @staticmethod
+    def _partner_orientation_scores(
+        anchors: Sequence[Tuple[int, int, BasePairCandidate]],
+        primary_position: Dict[int, int],
+        partner_position: Dict[int, int],
+    ) -> Dict[int, float]:
+        """Score both partner orientations from local register consistency.
+
+        A reciprocal residual score makes each consecutive anchor vote for the
+        orientation whose partner displacement best matches its primary-strand
+        displacement. Large register jumps and circular wraparound steps have
+        bounded influence instead of allowing the two endpoints to decide the
+        whole strand orientation.
+        """
+        scores = {-1: 0.0, 1: 0.0}
+        for previous, current in zip(anchors, anchors[1:]):
+            primary_step = primary_position[current[0]] - primary_position[previous[0]]
+            partner_step = partner_position[current[1]] - partner_position[previous[1]]
+            if primary_step <= 0 or partner_step == 0:
+                continue
+
+            scale = float(max(1, primary_step))
+            for direction in (-1, 1):
+                normalized_residual = abs(partner_step - direction * primary_step) / scale
+                scores[direction] += 1.0 / (1.0 + normalized_residual)
+        return scores
+
+    @classmethod
+    def _select_partner_direction(
+        cls,
+        anchors: Sequence[Tuple[int, int, BasePairCandidate]],
+        primary_position: Dict[int, int],
+        partner_position: Dict[int, int],
+    ) -> int:
+        """Return the best-scoring orientation, preferring antiparallel ties."""
+        scores = cls._partner_orientation_scores(
+            anchors,
+            primary_position,
+            partner_position,
+        )
+        return max((-1, 1), key=lambda direction: scores[direction])
 
     def _pair_geometry_marker(
         self,
@@ -838,43 +1141,112 @@ class RobustTopologyInferrer:
     ) -> Optional[Tuple[int, int, str]]:
         residue_1 = self.residues[candidate.first]
         residue_2 = self.residues[candidate.second]
-        atom_pairs = candidate.atom_pairs or self._marker_atom_pairs(candidate)
-        if not atom_pairs:
+        fitted_geometry_eligible = bool(
+            candidate.fitted_geometry
+            and candidate.fitted_geometry.get("eligible")
+        )
+        strong_contact_support = candidate.strong_contact_support
+
+        def has_strong_contact_support() -> bool:
+            nonlocal strong_contact_support
+            if strong_contact_support is None:
+                strong_contact_support = self._has_strong_coordinate_pair_support(
+                    residue_1,
+                    residue_2,
+                )
+            return bool(strong_contact_support)
+
+        if (
+            candidate.fitted_geometry is not None
+            and not fitted_geometry_eligible
+            and not (
+                candidate.lw_classification is not None
+                and candidate.lw_classification.confident
+            )
+            and not has_strong_contact_support()
+        ):
             return None
 
-        edge_1 = self._dominant_edge_for_atoms(
-            residue_1.base,
-            [atom_1 for atom_1, _, _ in atom_pairs],
-        )
-        edge_2 = self._dominant_edge_for_atoms(
-            residue_2.base,
-            [atom_2 for _, atom_2, _ in atom_pairs],
-        )
-        if not edge_1 or not edge_2:
-            return None
+        lw_classification = candidate.lw_classification
+        if lw_classification is not None and lw_classification.confident:
+            tag = lw_classification.tag
+            edge_1 = lw_classification.edge_1
+            edge_2 = lw_classification.edge_2
+            orientation = tag[0]
+        else:
+            tag = ""
+        possible_cww = False
 
-        pattern_matches, pattern_family = self._pattern_hbond_matches(
-            residue_1.base,
-            residue_2.base,
-            self._atom_map(residue_1),
-            self._atom_map(residue_2),
-        )
-        canonical_watson_contacts = (
-            edge_1 == edge_2 == "W"
-            and pattern_family == "watson_crick_or_wobble"
-            and len(pattern_matches) >= 2
-        )
-        orientation = "c" if canonical_watson_contacts else (
-            self._measured_glycosidic_orientation(candidate, atom_pairs)
-            or self._lw_orientation_from_edges(edge_1, edge_2, strand_direction)
-        )
-        tag = self._lw_tag_for_edges(edge_1, edge_2, orientation)
+        # Relative standard-frame pose is stronger evidence than a vote over
+        # shared edge atoms. This is especially important for mismatches:
+        # non-complementary identity does not make a cWW pose trans-WW/cSW.
+        fitted_cww = self._is_fitted_cww_pose(candidate.fitted_geometry)
+        if not tag and fitted_cww:
+            edge_1 = edge_2 = "W"
+            orientation = "c"
+        elif not tag:
+            atom_pairs = candidate.atom_pairs or self._marker_atom_pairs(candidate)
+            if not atom_pairs:
+                return None
+            edge_1 = self._dominant_edge_for_atoms(
+                residue_1.base,
+                [atom_1 for atom_1, _, _ in atom_pairs],
+            )
+            edge_2 = self._dominant_edge_for_atoms(
+                residue_2.base,
+                [atom_2 for _, atom_2, _ in atom_pairs],
+            )
+            if not edge_1 or not edge_2:
+                return None
+
+            pattern_matches, pattern_family = self._pattern_hbond_matches(
+                residue_1.base,
+                residue_2.base,
+                self._atom_map(residue_1),
+                self._atom_map(residue_2),
+            )
+            canonical_watson_contacts = (
+                edge_1 == edge_2 == "W"
+                and pattern_family == "watson_crick_or_wobble"
+                and len(pattern_matches) >= 2
+            )
+            possible_cww = bool(
+                canonical_watson_contacts
+                and (fitted_geometry_eligible or has_strong_contact_support())
+            )
+            orientation = "c" if canonical_watson_contacts else (
+                self._measured_glycosidic_orientation(candidate, atom_pairs)
+                or self._lw_orientation_from_edges(edge_1, edge_2, strand_direction)
+            )
+            confident_trans_ww = (
+                edge_1 == edge_2 == "W"
+                and orientation == "t"
+                and len(atom_pairs) >= 2
+                and (fitted_geometry_eligible or has_strong_contact_support())
+            )
+            confident_named_hoogsteen = (
+                candidate.is_hoogsteen or candidate.pair_family == "hoogsteen_like"
+            )
+            # A complete named Watson-contact pattern is sufficient to emit an
+            # explicit cWW marker even when the fitted-frame envelope is too
+            # strict for a highly opened pair. Generic edge votes remain
+            # advisory for every other family.
+            if possible_cww:
+                tag = "cWW"
+            elif not (confident_trans_ww or confident_named_hoogsteen):
+                if fitted_geometry_eligible or has_strong_contact_support():
+                    tag = "unresolved"
+                else:
+                    return None
+        if not tag:
+            tag = self._lw_tag_for_edges(edge_1, edge_2, orientation)
         measured_noncanonical = (edge_1, edge_2) != ("W", "W") or orientation == "t"
         should_write = (
             candidate.is_hoogsteen
-            or candidate.pair_family == "hbonded_noncanonical"
             or not self._is_complementary(residue_1.base, residue_2.base)
             or measured_noncanonical
+            or possible_cww
+            or tag == "unresolved"
         )
         if not should_write:
             return None
@@ -895,6 +1267,10 @@ class RobustTopologyInferrer:
         generic_matches = self._generic_hbond_matches(residue_1, residue_2, atom_map_1, atom_map_2)
         matches = pattern_matches if len(pattern_matches) >= len(generic_matches) else generic_matches
         return tuple(matches)
+
+    @staticmethod
+    def _is_fitted_cww_pose(fitted_geometry: Optional[Dict[str, object]]) -> bool:
+        return is_fitted_cww_pose(fitted_geometry)
 
     @staticmethod
     def _dominant_edge_for_atoms(base: str, atom_names: Sequence[str]) -> str:
@@ -923,22 +1299,6 @@ class RobustTopologyInferrer:
     @staticmethod
     def _lw_tag_for_edges(edge_1: str, edge_2: str, orientation: str) -> str:
         return f"{orientation}{edge_1}{edge_2}"
-
-    def _glycosidic_markers_for_map(
-        self,
-        ni_map: np.ndarray,
-    ) -> Dict[Tuple[int, int], str]:
-        markers: Dict[Tuple[int, int], str] = {}
-        for strand_index, row in enumerate(np.asarray(ni_map), start=1):
-            for level, raw_subunit in enumerate(row, start=1):
-                subunit = int(raw_subunit)
-                if subunit <= 0 or subunit not in self.residues:
-                    continue
-                residue = self.residues[subunit]
-                conformation = infer_glycosidic_conformation(residue.base, self._atom_map(residue))
-                if conformation == "syn":
-                    markers[(strand_index, level)] = "syn"
-        return markers
 
     def _measured_glycosidic_orientation(
         self,
@@ -1425,11 +1785,33 @@ class RobustTopologyInferrer:
             atom_map_2,
         )
         if not self._is_complementary(residue_1.base, residue_2.base):
-            generic_matches = self._generic_hbond_matches(residue_1, residue_2, atom_map_1, atom_map_2)
-            if len(pattern_matches) >= 1 or len(generic_matches) >= 2:
+            donor_acceptor_matches = self._generic_hbond_matches(
+                residue_1,
+                residue_2,
+                atom_map_1,
+                atom_map_2,
+                donor_acceptor_only=True,
+            )
+            fitted_geometry = self._fitted_pair_geometry(residue_1, residue_2)
+            if (
+                fitted_geometry is not None
+                and not bool(fitted_geometry.get("eligible"))
+                and not self._has_strong_coordinate_pair_support(
+                    residue_1,
+                    residue_2,
+                    atom_map_1,
+                    atom_map_2,
+                    pattern_matches=pattern_matches,
+                )
+            ):
+                # Register interpolation must not turn face-to-face stacking
+                # into a mismatch pair.  Strong chemical contacts may override
+                # an extreme fitted pose, but atom proximity alone may not.
+                return False
+            if len(pattern_matches) >= 1 or len(donor_acceptor_matches) >= 2:
                 return True
             return (
-                len(generic_matches) >= 1
+                len(donor_acceptor_matches) >= 1
                 and center_distance <= REGISTER_GAP_NONCANONICAL_SINGLE_CONTACT_CENTER_CUTOFF
                 and hbond_center_distance <= REGISTER_GAP_NONCANONICAL_SINGLE_CONTACT_HBOND_CENTER_CUTOFF
             )
@@ -1807,7 +2189,6 @@ class RobustTopologyInferrer:
             chain_ids=[self.residues[selected[0]].chain],
             comb=False,
             grv=False,
-            glycosidic_conformation_markers=self._glycosidic_markers_for_map(row.reshape(1, -1)),
         )
 
     def _build_pairing_graph(self) -> nx.Graph:
@@ -1870,7 +2251,6 @@ class RobustTopologyInferrer:
                 chain_ids=[self.residues[selected[0][0]].chain],
                 comb=False,
                 grv=False,
-                glycosidic_conformation_markers=self._glycosidic_markers_for_map(row.reshape(1, -1)),
             )
 
         ref = selected[0]
@@ -1932,7 +2312,6 @@ class RobustTopologyInferrer:
             comb=True,
             fit=True,
             grv=paired_count >= 4,
-            glycosidic_conformation_markers=self._glycosidic_markers_for_map(ni_map),
         )
 
     def _trim_to_paired_core(self, rows: List[List[int]], nu_raw: List[int]) -> Tuple[List[List[int]], List[int]]:
